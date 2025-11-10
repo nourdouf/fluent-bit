@@ -491,7 +491,7 @@ static int ingest_all_chunks(struct flb_azure_kusto *ctx, struct flb_config *con
             }
 
             /* Call azure_kusto_queued_ingestion to ingest the payload */
-            ret = azure_kusto_queued_ingestion(ctx, tag_sds, flb_sds_len(tag_sds), final_payload, final_payload_size, chunk);
+            ret = azure_kusto_queued_ingestion(ctx, tag_sds, flb_sds_len(tag_sds), final_payload, final_payload_size, chunk, NULL);
             if (ret != 0) {
                 flb_plg_error(ctx->ins, "ingest_all_old_buffer_files :: Failed to ingest data to Azure Kusto");
                 if (chunk){
@@ -676,7 +676,7 @@ static void cb_azure_kusto_ingest(struct flb_config *config, void *data)
             flb_plg_debug(ctx->ins, "scheduler_kusto_ingest ::: before starting kusto queued ingestion %s", file->fsf->name);
 
             /* Perform the queued ingestion */
-            ret = azure_kusto_queued_ingestion(ctx, tag_sds, flb_sds_len(tag_sds), final_payload, final_payload_size, NULL);
+            ret = azure_kusto_queued_ingestion(ctx, tag_sds, flb_sds_len(tag_sds), final_payload, final_payload_size, NULL, NULL);
             if (ret != 0) {
                 flb_plg_error(ctx->ins, "scheduler_kusto_ingest: Failed to ingest data to kusto");
 
@@ -770,7 +770,7 @@ static void cb_azure_kusto_ingest(struct flb_config *config, void *data)
  */
 static int ingest_to_kusto(void *out_context, flb_sds_t new_data,
                                struct azure_kusto_file *upload_file,
-                               const char *tag, int tag_len)
+                               const char *tag, int tag_len, const char *table_name)
 {
     int ret;
     char *buffer = NULL;
@@ -820,7 +820,7 @@ static int ingest_to_kusto(void *out_context, flb_sds_t new_data,
     }
 
     /* Call azure_kusto_queued_ingestion to ingest the payload */
-    ret = azure_kusto_queued_ingestion(ctx, tag_sds, tag_len, final_payload, final_payload_size, upload_file);
+    ret = azure_kusto_queued_ingestion(ctx, tag_sds, tag_len, final_payload, final_payload_size, upload_file, table_name);
     if (ret != 0) {
         flb_plg_error(ctx->ins, "Failed to ingest data to Azure Kusto");
         flb_sds_destroy(tag_sds);
@@ -959,6 +959,42 @@ static int cb_azure_kusto_init(struct flb_output_instance *ins, struct flb_confi
     return 0;
 }
 
+/**
+ * Extract table_name field from log event body if it exists.
+ * Returns an allocated flb_sds_t with the table name, or NULL if not found.
+ * If found and should_remove is true, removes the table_name field from the body.
+ */
+static flb_sds_t extract_table_name_from_body(msgpack_object *body, int should_remove)
+{
+    int i;
+    msgpack_object_kv *kv;
+    msgpack_object *key;
+    msgpack_object *val;
+
+    if (body == NULL || body->type != MSGPACK_OBJECT_MAP) {
+        return NULL;
+    }
+
+    /* Search for table_name key in the body */
+    for (i = 0; i < body->via.map.size; i++) {
+        kv = &body->via.map.ptr[i];
+        key = &kv->key;
+        val = &kv->val;
+
+        if (key->type == MSGPACK_OBJECT_STR && 
+            key->via.str.size == 10 &&
+            strncmp(key->via.str.ptr, "table_name", 10) == 0) {
+            
+            if (val->type == MSGPACK_OBJECT_STR) {
+                /* Found table_name field, extract it */
+                return flb_sds_create_len(val->via.str.ptr, val->via.str.size);
+            }
+        }
+    }
+
+    return NULL;
+}
+
 
 /**
      * This function formats log data for Azure Kusto ingestion.
@@ -973,13 +1009,14 @@ static int cb_azure_kusto_init(struct flb_output_instance *ins, struct flb_confi
      * - bytes: Size of the raw log data.
      * - out_data: Pointer to store the formatted output data.
      * - out_size: Pointer to store the size of the formatted output data.
+     * - out_table_name: Pointer to store extracted table_name (allocated, NULL if not found).
      *
      * Returns:
      * - 0 on success, or -1 on error.
      */
 static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int tag_len,
                               const void *data, size_t bytes, void **out_data,
-                              size_t *out_size,
+                              size_t *out_size, flb_sds_t *out_table_name,
                               struct flb_config *config)
 {
     int index;
@@ -994,6 +1031,8 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
     struct flb_log_event log_event;
     int ret;
     flb_sds_t out_buf;
+    flb_sds_t extracted_table = NULL;
+    int is_first_record = FLB_TRUE;
 
     /* Create array for all records */
     records = flb_mp_count(data, bytes);
@@ -1022,6 +1061,12 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
 
     while ((ret = flb_log_event_decoder_next(&log_decoder, &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         msgpack_sbuffer_clear(&mp_sbuf);
+
+        /* Extract table_name from first record if present */
+        if (is_first_record == FLB_TRUE) {
+            extracted_table = extract_table_name_from_body(log_event.body, 0);
+            is_first_record = FLB_FALSE;
+        }
 
         int map_size = 1;
         if (ctx->include_time_key == FLB_TRUE) {
@@ -1059,10 +1104,23 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
         msgpack_pack_str_body(&mp_pck, ctx->log_key, flb_sds_len(ctx->log_key));
 
         if (log_event.group_attributes != NULL && log_event.body != NULL) {
+            int body_fields_to_pack = log_event.body->via.map.size;
+            
+            /* Count fields, excluding table_name if present */
+            for (index = 0; index < log_event.body->via.map.size; index++) {
+                msgpack_object_kv *kv = &log_event.body->via.map.ptr[index];
+                if (kv->key.type == MSGPACK_OBJECT_STR &&
+                    kv->key.via.str.size == 10 &&
+                    strncmp(kv->key.via.str.ptr, "table_name", 10) == 0) {
+                    body_fields_to_pack--;
+                    break;
+                }
+            }
+
             msgpack_pack_map(&mp_pck,
                                  log_event.group_attributes->via.map.size +
                                  log_event.metadata->via.map.size +
-                                 log_event.body->via.map.size);
+                                 body_fields_to_pack);
 
             for (index = 0; index < log_event.group_attributes->via.map.size; index++) { 
                 msgpack_pack_object(&mp_pck, log_event.group_attributes->via.map.ptr[index].key);
@@ -1074,9 +1132,19 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
                 msgpack_pack_object(&mp_pck, log_event.metadata->via.map.ptr[index].val);
             }
 
+            /* Pack body fields, skipping table_name */
             for (index = 0; index < log_event.body->via.map.size; index++) {
-                msgpack_pack_object(&mp_pck, log_event.body->via.map.ptr[index].key);
-                msgpack_pack_object(&mp_pck, log_event.body->via.map.ptr[index].val);
+                msgpack_object_kv *kv = &log_event.body->via.map.ptr[index];
+                
+                /* Skip table_name field */
+                if (kv->key.type == MSGPACK_OBJECT_STR &&
+                    kv->key.via.str.size == 10 &&
+                    strncmp(kv->key.via.str.ptr, "table_name", 10) == 0) {
+                    continue;
+                }
+                
+                msgpack_pack_object(&mp_pck, kv->key);
+                msgpack_pack_object(&mp_pck, kv->val);
             }
         }
         else if (log_event.body != NULL) {
@@ -1109,6 +1177,7 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
 
     *out_data = out_buf;
     *out_size = flb_sds_len(out_buf);
+    *out_table_name = extracted_table;  /* Return extracted table name or NULL */
 
     return 0;
 }
@@ -1232,6 +1301,8 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
     int total_file_size_check = FLB_FALSE;
     flb_sds_t tag_name = NULL;
     size_t tag_name_len;
+    flb_sds_t dynamic_table_name = NULL;
+    const char *target_table = NULL;
 
     (void)i_ins;
     (void)config;
@@ -1259,12 +1330,15 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
         /* Reformat msgpack to JSON payload */
         ret = azure_kusto_format(ctx, tag_name, tag_name_len, event_chunk->data,
                                  event_chunk->size, (void **)&json, &json_size,
-                                 config);
+                                 &dynamic_table_name, config);
         if (ret != 0) {
             flb_plg_error(ctx->ins, "cannot reformat data into json");
             ret = FLB_RETRY;
             goto error;
         }
+
+        /* Use dynamic table name if present, otherwise use configured table_name */
+        target_table = (dynamic_table_name != NULL) ? dynamic_table_name : ctx->table_name;
 
         /* Get a file candidate matching the given 'tag' */
         upload_file = azure_kusto_store_file_get(ctx,
@@ -1313,7 +1387,7 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
             /* Ingest data to kusto */
             ret = ingest_to_kusto(ctx, json, upload_file,
                                       tag_name,
-                                      tag_name_len);
+                                      tag_name_len, target_table);
 
             if (ret == 0){
                 if (ctx->buffering_enabled == FLB_TRUE && ctx->buffer_file_delete_early == FLB_TRUE){
@@ -1371,12 +1445,15 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
         /* Reformat msgpack data to JSON payload */
         ret = azure_kusto_format(ctx, event_chunk->tag, tag_len, event_chunk->data,
                                  event_chunk->size, (void **)&json, &json_size,
-                                 config);
+                                 &dynamic_table_name, config);
         if (ret != 0) {
             flb_plg_error(ctx->ins, "cannot reformat data into json");
             ret = FLB_RETRY;
             goto error;
         }
+
+        /* Use dynamic table name if present, otherwise use configured table_name */
+        target_table = (dynamic_table_name != NULL) ? dynamic_table_name : ctx->table_name;
 
         flb_plg_debug(ctx->ins, "payload size before compression %zu", json_size);
         /* Map buffer */
@@ -1410,7 +1487,7 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
         }
 
         /* Perform queued ingestion to Kusto */
-        ret = azure_kusto_queued_ingestion(ctx, event_chunk->tag, tag_len, final_payload, final_payload_size, NULL);
+        ret = azure_kusto_queued_ingestion(ctx, event_chunk->tag, tag_len, final_payload, final_payload_size, NULL, target_table);
         flb_plg_trace(ctx->ins, "after kusto queued ingestion %d", ret);
         if (ret != 0) {
             flb_plg_error(ctx->ins, "cannot perform queued ingestion");
@@ -1433,6 +1510,9 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
     if (tag_name) {
         flb_sds_destroy(tag_name);
     }
+    if (dynamic_table_name) {
+        flb_sds_destroy(dynamic_table_name);
+    }
     FLB_OUTPUT_RETURN(ret);
 
     error:
@@ -1445,6 +1525,9 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
     }
     if (tag_name) {
         flb_sds_destroy(tag_name);
+    }
+    if (dynamic_table_name) {
+        flb_sds_destroy(dynamic_table_name);
     }
     FLB_OUTPUT_RETURN(ret);
 }
