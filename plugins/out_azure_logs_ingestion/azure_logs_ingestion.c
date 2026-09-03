@@ -474,6 +474,8 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
     struct flb_http_client *c = NULL;
 #ifdef FLB_HAVE_METRICS
     char status[16];
+    uint64_t metrics_timestamp;
+    char *output_name;
 #endif
 
     token = get_az_li_token(ctx);
@@ -510,7 +512,18 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
                               (double) chunk_count,
                               2, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id});
     }
+    metrics_timestamp = cfl_time_now();
+    output_name = (char *) flb_output_name(ctx->ins);
+    cmt_histogram_observe(ctx->cmt_uncompressed_payload_size,
+                          metrics_timestamp,
+                          (double) body->json_size,
+                          1, (char *[]) {output_name});
+    cmt_histogram_observe(ctx->cmt_http_payload_size,
+                          metrics_timestamp,
+                          (double) final_payload_size,
+                          1, (char *[]) {output_name});
 #endif
+
     /* Execute rest call */
     ret = flb_http_do(c, &b_sent);
 #ifdef FLB_HAVE_METRICS

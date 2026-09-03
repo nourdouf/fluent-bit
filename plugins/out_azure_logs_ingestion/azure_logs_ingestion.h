@@ -99,6 +99,8 @@ struct flb_az_li {
 #ifdef FLB_HAVE_METRICS
     struct cmt_histogram *cmt_chunks_per_request;
     struct cmt_counter *cmt_http_responses;
+    struct cmt_histogram *cmt_uncompressed_payload_size;
+    struct cmt_histogram *cmt_http_payload_size;
 #endif
 
     /* plugin output and config instance reference */
