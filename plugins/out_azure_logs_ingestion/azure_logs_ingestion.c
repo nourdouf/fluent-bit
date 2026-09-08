@@ -512,16 +512,19 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
                               (double) chunk_count,
                               2, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id});
     }
-    metrics_timestamp = cfl_time_now();
-    output_name = (char *) flb_output_name(ctx->ins);
-    cmt_histogram_observe(ctx->cmt_uncompressed_payload_size,
-                          metrics_timestamp,
-                          (double) body->json_size,
-                          1, (char *[]) {output_name});
-    cmt_histogram_observe(ctx->cmt_http_payload_size,
-                          metrics_timestamp,
-                          (double) final_payload_size,
-                          1, (char *[]) {output_name});
+    if (ctx->cmt_uncompressed_payload_size != NULL &&
+        ctx->cmt_http_payload_size != NULL) {
+        metrics_timestamp = cfl_time_now();
+        output_name = (char *) flb_output_name(ctx->ins);
+        cmt_histogram_observe(ctx->cmt_uncompressed_payload_size,
+                              metrics_timestamp,
+                              (double) body->json_size,
+                              2, (char *[]) {output_name, ctx->dcr_id});
+        cmt_histogram_observe(ctx->cmt_http_payload_size,
+                              metrics_timestamp,
+                              (double) final_payload_size,
+                              2, (char *[]) {output_name, ctx->dcr_id});
+    }
 #endif
 
     /* Execute rest call */
