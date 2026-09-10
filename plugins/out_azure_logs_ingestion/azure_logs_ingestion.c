@@ -287,7 +287,7 @@ token_cleanup:
 }
 
 /* The sender owns the copied JSON body; this helper returns only after cleanup. */
-static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload)
+static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_count)
 {
     int ret;
     int flush_status;
@@ -299,6 +299,9 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload)
     struct flb_connection *u_conn;
     struct flb_http_client *c = NULL;
     int is_compressed = FLB_FALSE;
+#ifdef FLB_HAVE_METRICS
+    char status[16];
+#endif
 
     u_conn = flb_upstream_conn_get(ctx->u_dce);
     if (!u_conn) {
@@ -349,8 +352,24 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload)
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
     flb_http_buffer_size(c, FLB_HTTP_DATA_SIZE_MAX);
 
+#ifdef FLB_HAVE_METRICS
+    if (ctx->cmt_chunks_per_request) {
+        cmt_histogram_observe(ctx->cmt_chunks_per_request, cfl_time_now(),
+                              (double) chunk_count,
+                              2, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id});
+    }
+#endif
     /* Execute rest call */
     ret = flb_http_do(c, &b_sent);
+#ifdef FLB_HAVE_METRICS
+    /* Only completed HTTP exchanges count. A transport error may leave a partial
+     * status in the client; deliberately exclude it rather than invent a response. */
+    if (ret == 0 && c->resp.status >= 100 && c->resp.status <= 599 && ctx->cmt_http_responses) {
+        snprintf(status, sizeof(status), "%i", c->resp.status);
+        cmt_counter_inc(ctx->cmt_http_responses, cfl_time_now(),
+                        3, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id, status});
+    }
+#endif
     if (ret != 0) {
         flb_plg_warn(ctx->ins, "http_do=%i", ret);
         flush_status = FLB_RETRY;
@@ -564,7 +583,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
                          ctx, config) != 0) {
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
-        result = az_li_send(ctx, payload);
+        result = az_li_send(ctx, payload, 1);
         FLB_OUTPUT_RETURN(result);
     }
 
@@ -594,7 +613,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
 
     if (member.send) {
         payload = az_li_batch_format(ctx, batch);
-        batch->result = payload ? az_li_send(ctx, payload) : FLB_ERROR;
+        batch->result = payload ? az_li_send(ctx, payload, batch->count) : FLB_ERROR;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
         batch->done = FLB_TRUE;
     }

@@ -38,6 +38,11 @@
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_sds.h>
 
+#ifdef FLB_HAVE_METRICS
+#include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_counter.h>
+#endif
+
 /* Context structure for Azure Logs Ingestion API */
 struct flb_az_li {
     /* Opt-in, whole callback chunks; used only on the main scheduler. */
@@ -73,6 +78,11 @@ struct flb_az_li {
     /* upstream connection to the data collection endpoint */
     struct flb_upstream *u_dce;
     flb_sds_t dce_u_url;
+
+#ifdef FLB_HAVE_METRICS
+    struct cmt_histogram *cmt_chunks_per_request;
+    struct cmt_counter *cmt_http_responses;
+#endif
 
     /* plugin output and config instance reference */
     struct flb_output_instance *ins;
