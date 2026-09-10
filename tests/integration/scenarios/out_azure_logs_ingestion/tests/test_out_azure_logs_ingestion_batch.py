@@ -1,5 +1,6 @@
 """Real engine chunks: each finite dummy instance owns a distinct input chunk."""
 import collections
+import os
 import threading
 import time
 import logging
@@ -257,6 +258,79 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         assert result.returncode == 255, report
         if valgrind_enabled():
             assert "ERROR SUMMARY: 0 errors" in report, report
+
+
+def linux_timer_count(service):
+    timers = 0
+    pid = service.flb.target_pid or service.flb.process.pid
+    for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            timers += os.readlink(descriptor) == "anon_inode:[timerfd]"
+        except FileNotFoundError:
+            continue
+    return timers
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="requires Linux timerfd accounting")
+def test_idle_batching_does_not_add_scheduler_timers(tmp_path):
+    counts = []
+    for enabled in (False, True):
+        service = batch_service(tmp_path, count=1)
+        path = Path(service.service.config_path)
+        config = yaml.safe_load(path.read_text())
+        config["pipeline"]["inputs"][0]["interval_sec"] = 3600
+        if not enabled:
+            output = config["pipeline"]["outputs"][0]
+            del output["batch_chunk_count"]
+            del output["batch_wait_ms"]
+        path.write_text(yaml.safe_dump(config))
+        try:
+            service.start()
+            counts.append(linux_timer_count(service))
+        finally:
+            stop_checked(service)
+    assert counts[1] == counts[0], counts
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="requires Linux timerfd accounting")
+def test_batch_timer_rearms_and_releases_after_delivery(tmp_path, monkeypatch):
+    service = batch_service(tmp_path, wait_ms=10000)
+    port = service.service.allocate_port_env("TEST_BATCH_INPUT_PORT")
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"]["flush"] = 0.1
+    config["pipeline"]["inputs"] = [
+        {"name": "http", "listen": "127.0.0.1", "port": port}]
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    try:
+        service.start()
+        idle_timers = linux_timer_count(service)
+        for batch in range(2):
+            first = batch * 3
+            response = requests.post(f"http://127.0.0.1:{port}/chunk.{first}",
+                                     json={"chunk_id": first}, timeout=2)
+            response.raise_for_status()
+            service.service.wait_for_condition(
+                lambda: linux_timer_count(service) == idle_timers + 1,
+                timeout=5, description="batch timer armed for pending chunk")
+            for chunk_id in range(first + 1, first + 3):
+                response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
+                                         json={"chunk_id": chunk_id}, timeout=2)
+                response.raise_for_status()
+            item = gates.wait(service, batch + 1)
+            assert {record["chunk_id"] for record in item["records"]} == set(range(first, first + 3))
+            item["gate"].set()
+            service.service.wait_for_condition(
+                lambda: metrics(service)["proc_records"] == first + 3,
+                timeout=10, description="batch delivered")
+            service.service.wait_for_condition(
+                lambda: linux_timer_count(service) == idle_timers,
+                timeout=5, description="batch timer released after delivery")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
 
 
 CHUNKS = "fluentbit_azure_logs_ingestion_chunks_per_request"
