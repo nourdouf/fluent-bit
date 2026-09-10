@@ -40,6 +40,13 @@
 
 /* Context structure for Azure Logs Ingestion API */
 struct flb_az_li {
+    /* Opt-in, whole callback chunks; used only on the main scheduler. */
+    int batch_chunk_count;
+    int batch_wait_ms;
+    struct az_li_batch *collecting;
+    struct mk_list parked;
+    struct flb_sched_timer *batch_timer;
+
     /* log ingestion account setup */
     flb_sds_t tenant_id;
     flb_sds_t client_id;
