@@ -68,7 +68,7 @@ class Gates:
         if request.headers.get("Content-Encoding") == "gzip":
             body = gzip.decompress(body)
         item = {"gate": gate, "records": json.loads(body), "status": 200,
-                "time": time.time()}
+                "time": time.time(), "path": request.path}
         with self.lock:
             self.requests.append(item)
         if self.closing.is_set():
@@ -257,3 +257,116 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         assert result.returncode == 255, report
         if valgrind_enabled():
             assert "ERROR SUMMARY: 0 errors" in report, report
+
+
+CHUNKS = "fluentbit_azure_logs_ingestion_chunks_per_request"
+RESPONSES = "fluentbit_azure_logs_ingestion_http_responses_total"
+
+
+def request_metric(service, metric_name, **labels):
+    def snapshot():
+        response = requests.get(
+            f"http://127.0.0.1:{service.flb.http_monitoring_port}/api/v2/metrics/prometheus", timeout=2)
+        # The endpoint returns 404 until the first periodic metrics snapshot exists.
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.text
+
+    text = service.service.wait_for_condition(
+        snapshot, timeout=10, interval=0.05, description="first Prometheus metrics snapshot")
+    for line in text.splitlines():
+        match = re.match(r'^([^ {]+)\{([^}]+)\} ([^ ]+)', line)
+        if match and match[1] == metric_name:
+            actual = dict(re.findall(r'(\w+)="([^"]*)"', match[2]))
+            if actual == labels:
+                return float(match[3])
+    return 0
+
+
+@pytest.mark.parametrize("chunk_count", [1, 3])
+@pytest.mark.parametrize("status", [200, 204, 413, 429, 500])
+def test_request_metrics_count_attempt_not_participants(tmp_path, monkeypatch, chunk_count, status):
+    service = batch_service(tmp_path, count=chunk_count)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"].update({"scheduler.base": 1, "scheduler.cap": 1})
+    output = config["pipeline"]["outputs"][0]
+    output["retry_limit"] = 1
+    if chunk_count == 1:
+        del output["batch_chunk_count"]
+        del output["batch_wait_ms"]
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite"}
+    try:
+        service.start()
+        item = gates.wait(service, 1)
+        service.service.wait_for_condition(
+            lambda: request_metric(service, CHUNKS + "_count", **labels) == 1,
+            timeout=5, description="one request attempt histogram observation")
+        assert request_metric(service, CHUNKS + "_sum", **labels) == chunk_count
+        assert request_metric(service, RESPONSES, **labels, status=str(status)) == 0
+        item["status"] = status
+        item["gate"].set()
+        service.service.wait_for_condition(
+            lambda: request_metric(service, RESPONSES, **labels, status=str(status)) == 1,
+            timeout=10, description="one completed ingestion response")
+        if status >= 400:
+            retry = gates.wait(service, 2)
+            service.service.wait_for_condition(
+                lambda: request_metric(service, CHUNKS + "_count", **labels) == 2,
+                timeout=10, description="engine retry attempt observed")
+            assert request_metric(service, CHUNKS + "_sum", **labels) == 2 * chunk_count
+            assert request_metric(service, RESPONSES, **labels, status=str(status)) == 1
+            retry["status"] = status
+            retry["gate"].set()
+            service.service.wait_for_condition(
+                lambda: metrics(service)["retries_failed"] == chunk_count,
+                timeout=10, description="finite retry exhausted")
+            service.service.wait_for_condition(
+                lambda: request_metric(service, RESPONSES, **labels, status=str(status)) == 2,
+                timeout=10, description="second completed failure response")
+        assert request_metric(service, CHUNKS + "_count", **labels) == len(gates.requests)
+        assert request_metric(service, CHUNKS + "_sum", **labels) == sum(
+            len({record["chunk_id"] for record in received["records"]})
+            for received in gates.requests)
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+
+
+def test_request_metrics_isolate_output_alias_and_dcr(tmp_path, monkeypatch):
+    service = batch_service(tmp_path)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    first = config["pipeline"]["outputs"][0]
+    first["alias"] = "first-output"
+    second = dict(first, alias="second-output", dcr_id="other-dcr")
+    config["pipeline"]["outputs"].append(second)
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    try:
+        service.start()
+        gates.wait(service, 2)
+        for alias, dcr, status in [("first-output", "dcr-suite", 200),
+                                   ("second-output", "other-dcr", 204)]:
+            labels = {"name": alias, "dcr_id": dcr}
+            service.service.wait_for_condition(
+                lambda: request_metric(service, CHUNKS + "_count", **labels) == 1,
+                timeout=10, description=f"attempt for {alias}")
+            assert request_metric(service, CHUNKS + "_sum", **labels) == 3
+            assert request_metric(service, RESPONSES, **labels, status=str(status)) == 0
+            item = next(item for item in gates.requests if f"/{dcr}/" in item["path"])
+            item["status"] = status
+            item["gate"].set()
+            service.service.wait_for_condition(
+                lambda: request_metric(service, RESPONSES, **labels, status=str(status)) == 1,
+                timeout=10, description=f"completed response for {alias}")
+            assert request_metric(service, CHUNKS + "_count", name=alias,
+                                  dcr_id="other-dcr" if dcr == "dcr-suite" else "dcr-suite") == 0
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
