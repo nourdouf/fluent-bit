@@ -85,13 +85,6 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
-        /* Must exist before any flush can suspend. Use this thread's scheduler. */
-        if (flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
-                                     10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
-            flb_plg_error(ins, "cannot create batch timer");
-            flb_az_li_ctx_destroy(ctx);
-            return -1;
-        }
     }
     return 0;
 }
@@ -488,6 +481,10 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
         mk_list_del(&member->parked_link);
         flb_coro_resume(coro);
     }
+    if (mk_list_is_empty(&ctx->parked) == 0) {
+        flb_sched_timer_cb_destroy(ctx->batch_timer);
+        ctx->batch_timer = NULL;
+    }
 }
 
 static flb_sds_t az_li_batch_format(struct flb_az_li *ctx, struct az_li_batch *batch)
@@ -578,13 +575,21 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     size_t size;
     int result;
 
-    if (!ctx->batch_timer) {
+    if (ctx->batch_chunk_count == 0) {
         if (az_li_format(event_chunk->data, event_chunk->size, &payload, &size,
                          ctx, config) != 0) {
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
         result = az_li_send(ctx, payload, 1);
         FLB_OUTPUT_RETURN(result);
+    }
+
+    /* Only callbacks parked by the plugin need polling; idle outputs need no timer. */
+    if (!ctx->batch_timer &&
+        flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
+                                  10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
+        flb_plg_error(ctx->ins, "cannot create batch timer");
+        FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
     batch = ctx->collecting;
