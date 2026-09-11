@@ -831,7 +831,7 @@ static struct flb_config_map config_map[] = {
      "Positive collection wait in milliseconds from the first chunk, not a network timeout."
     },
     {
-     FLB_CONFIG_MAP_TIME, "http.response_timeout", "60s",
+     FLB_CONFIG_MAP_TIME, "http.response_timeout", "5s",
      0, FLB_TRUE, offsetof(struct flb_az_li, response_timeout),
      "HTTP response timeout applied independently to OAuth and ingestion requests."
     },
