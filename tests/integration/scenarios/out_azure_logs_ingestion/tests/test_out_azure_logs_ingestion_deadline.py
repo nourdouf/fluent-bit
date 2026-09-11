@@ -185,8 +185,13 @@ def test_token_refresh_is_single_flight_and_keeps_engine_responsive(tmp_path, mo
 # Native response timeout starts after upload; response bytes do not reset it.
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
 @pytest.mark.parametrize("mode", ["blocked", "trickle"])
-def test_response_progress_does_not_extend_response_timeout(tmp_path, monkeypatch, stage, mode):
-    service, port = timeout_service(tmp_path)
+@pytest.mark.parametrize("response_timeout", [
+    pytest.param(None, id="default-timeout"),
+    pytest.param("5s", id="explicit-timeout"),
+])
+def test_response_progress_does_not_extend_response_timeout(
+        tmp_path, monkeypatch, stage, mode, response_timeout):
+    service, port = timeout_service(tmp_path, response_timeout=response_timeout)
     started = []
     original = http_server.app.view_functions["oauth_token"]
 
