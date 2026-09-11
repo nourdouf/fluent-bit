@@ -81,7 +81,7 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
         if (az_li_positive_option(flb_output_get_property("batch_chunk_count", ins),
                                   &ctx->batch_chunk_count) != 0 ||
             az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
-                                  &ctx->batch_wait_ms) != 0 || ins->tp_workers > 0) {
+                                  &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
             flb_plg_error(ins, "batching requires positive batch_chunk_count and batch_wait_ms "
                               "and workers=0");
             flb_az_li_ctx_destroy(ctx);
