@@ -1,7 +1,6 @@
-"""Local real-network experiments for a single OAuth + ingestion attempt budget."""
+"""Local real-network coverage for native, independent HTTP request timeouts."""
 import json
 import logging
-import signal
 import socket
 import socketserver
 import ssl
@@ -19,16 +18,18 @@ from test_out_azure_logs_ingestion_batch import (
 )
 
 
-def deadline_service(tmp_path, budget=5):
+def timeout_service(tmp_path, response_timeout="5s"):
     service = batch_service(tmp_path, count=0, wait_ms=10)
-    port = service.service.allocate_port_env("TEST_DEADLINE_INPUT_PORT")
+    port = service.service.allocate_port_env("TEST_TIMEOUT_INPUT_PORT")
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"].update({"flush": 0.05, "scheduler.base": 1, "scheduler.cap": 1})
     config["pipeline"]["inputs"] = [
         {"name": "http", "listen": "127.0.0.1", "port": port}]
     config["pipeline"]["outputs"][0].update(
-        {"batch_chunk_count": 1, "http_timeout": budget, "retry_limit": "no_retries"})
+        {"batch_chunk_count": 1, "retry_limit": "no_retries"})
+    if response_timeout is not None:
+        config["pipeline"]["outputs"][0]["http.response_timeout"] = response_timeout
     path.write_text(yaml.safe_dump(config))
     return service, port
 
@@ -46,12 +47,12 @@ def wait(service, predicate, description, timeout=10):
 
 def dropped_callbacks(service, count):
     # V1 counters are periodically snapshotted; use the engine's own callback
-    # completion log for the budget, then separately check the published counters.
+    # completion log for the timeout, then separately check the published counters.
     return Path(service.flb.log_file).read_text().count("is not retried (no retry config)") >= count
 
 
-def test_one_budget_includes_oauth_and_ingestion_then_recovers(tmp_path, monkeypatch):
-    service, port = deadline_service(tmp_path)
+def test_oauth_and_ingestion_have_independent_response_timeouts(tmp_path, monkeypatch):
+    service, port = timeout_service(tmp_path)
     oauth_started = []
     original = http_server.app.view_functions["oauth_token"]
 
@@ -66,20 +67,16 @@ def test_one_budget_includes_oauth_and_ingestion_then_recovers(tmp_path, monkeyp
         http_server.configure_http_response(delay_seconds=3)
         submit(port, 0)
         wait(service, lambda: oauth_started, "OAuth request")
-        # 0.7s allows dispatch/metrics polling, not another 3s stage budget.
-        wait(service, lambda: dropped_callbacks(service, 1),
-             "expired engine callback", timeout=5.7)
+        wait(service, lambda: metrics(service)["proc_records"] == 1,
+             "both individually valid requests complete", timeout=9)
         elapsed = time.monotonic() - oauth_started[0]
-        logging.getLogger(__name__).info("one-budget elapsed=%.3fs metrics=%s", elapsed, metrics(service))
-        assert 4.5 <= elapsed < 5.7
-        assert metrics(service)["proc_records"] == 0
-        labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite", "status": "200"}
-        assert request_metric(service, RESPONSES, **labels) == 0
+        assert elapsed >= 6  # The sum exceeds the 5s per-request setting.
+        assert not dropped_callbacks(service, 1)
         http_server.configure_http_response(delay_seconds=0)
         submit(port, 1)
-        wait(service, lambda: metrics(service)["proc_records"] == 1, "healthy recovery")
+        wait(service, lambda: metrics(service)["proc_records"] == 2, "cached token delivery")
         tokens = [r for r in http_server.data_storage["requests"] if r["path"] == "/oauth/token"]
-        assert len(tokens) == 1  # production token cache survives ingestion timeout
+        assert len(tokens) == 1  # production token cache avoids another OAuth request
         body = tokens[0]["raw_data"]
         for field in ("grant_type=client_credentials", "scope=https://monitor.azure.com/.default",
                       "client_id=suite-client", "client_secret=suite-secret"):
@@ -92,8 +89,8 @@ def test_one_budget_includes_oauth_and_ingestion_then_recovers(tmp_path, monkeyp
         stop_checked(service)
 
 
-def test_total_deadline_with_connection_timeout_disabled(tmp_path, monkeypatch):
-    service, port = deadline_service(tmp_path, budget=2)
+def test_response_timeout_with_connection_timeout_disabled(tmp_path, monkeypatch):
+    service, port = timeout_service(tmp_path, response_timeout="2s")
     set_output(service, **{"net.connect_timeout": 0})
     started = []
     original = http_server.app.view_functions["oauth_token"]
@@ -109,9 +106,9 @@ def test_total_deadline_with_connection_timeout_disabled(tmp_path, monkeypatch):
         submit(port, 0)
         wait(service, lambda: started, "initial OAuth")
         wait(service, lambda: dropped_callbacks(service, 1),
-             "total deadline independent of disabled connect timeout", timeout=2.7)
+             "response timeout independent of disabled connect timeout", timeout=5)
         elapsed = time.monotonic() - started[0]
-        assert 1.8 <= elapsed < 2.7, elapsed
+        assert 1 <= elapsed < 5, elapsed
         assert metrics(service)["proc_records"] == 0
         http_server.configure_http_response(delay_seconds=0)
         submit(port, 1)
@@ -121,8 +118,8 @@ def test_total_deadline_with_connection_timeout_disabled(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("count", [1, 3])
-def test_deadline_cancellation_preserves_busy_connection_count(tmp_path, count):
-    service, port = deadline_service(tmp_path, budget=3)
+def test_native_timeout_preserves_busy_connection_count(tmp_path, count):
+    service, port = timeout_service(tmp_path, response_timeout="3s")
     gauge = "fluentbit_output_upstream_busy_connections"
     total_gauge = "fluentbit_output_upstream_total_connections"
     labels = {"name": "azure_logs_ingestion.0"}
@@ -134,7 +131,7 @@ def test_deadline_cancellation_preserves_busy_connection_count(tmp_path, count):
         wait(service, lambda: request_metric(service, gauge, **labels) == count,
              "all ingestion connections busy", timeout=2.7)
         assert request_metric(service, total_gauge, **labels) == count
-        wait(service, lambda: dropped_callbacks(service, count), "all attempts expired", timeout=3.7)
+        wait(service, lambda: dropped_callbacks(service, count), "all requests timed out", timeout=6)
         wait(service, lambda: request_metric(service, gauge, **labels) <= 0,
              "busy connection count after cleanup")
         assert request_metric(service, gauge, **labels) == 0
@@ -150,8 +147,8 @@ def test_deadline_cancellation_preserves_busy_connection_count(tmp_path, count):
         stop_checked(service)
 
 
-def test_expired_token_refresh_waiters_have_independent_budgets(tmp_path, monkeypatch):
-    service, port = deadline_service(tmp_path)
+def test_token_refresh_is_single_flight_and_keeps_engine_responsive(tmp_path, monkeypatch):
+    service, port = timeout_service(tmp_path)
     token_times = []
     original = http_server.app.view_functions["oauth_token"]
 
@@ -162,78 +159,34 @@ def test_expired_token_refresh_waiters_have_independent_budgets(tmp_path, monkey
     monkeypatch.setitem(http_server.app.view_functions, "oauth_token", token_receiver)
     try:
         service.start()
-        # No access token is an expired cache according to production OAuth.
-        http_server.configure_oauth_token_response(delay_seconds=8)
+        http_server.configure_oauth_token_response(delay_seconds=3)
         submit(port, 0)
         wait(service, lambda: token_times, "refresh owner in OAuth")
-        submit(port, 1)
-        started = token_times[0]
+        for chunk_id in range(1, 8):
+            submit(port, chunk_id)
         samples = []
-        while time.monotonic() - started < 4:
+        while time.monotonic() - token_times[0] < 2:
             before = time.monotonic()
             assert metrics(service)["proc_records"] == 0
             samples.append(time.monotonic() - before)
-            time.sleep(0.1)  # Deliberately sample event-loop responsiveness during contention.
-        assert max(samples) < 0.5, samples
-        wait(service, lambda: dropped_callbacks(service, 2),
-             "owner and waiter both expire", timeout=1.7)
-        elapsed = time.monotonic() - started
-        logging.getLogger(__name__).info("contention elapsed=%.3fs worst_probe=%.3fs", elapsed, max(samples))
-        assert elapsed < 5.7
+            time.sleep(0.1)  # Sample event-loop responsiveness during contention.
+        assert samples and max(samples) < 0.5, samples
+        wait(service, lambda: metrics(service)["proc_records"] == 8,
+             "owner and every waiter acknowledged once")
         assert len(token_times) == 1
-        assert not any(r["path"].startswith("/dataCollectionRules/")
-                       for r in http_server.data_storage["requests"])
-        http_server.configure_oauth_token_response(delay_seconds=0)
-        submit(port, 2)
-        wait(service, lambda: metrics(service)["proc_records"] == 1, "refresh lock recovery")
-        assert len(token_times) == 2
+        assert not dropped_callbacks(service, 1)
+        ingestion = [r for r in http_server.data_storage["requests"]
+                     if r["path"].startswith("/dataCollectionRules/")]
+        assert len(ingestion) == 8
     finally:
         stop_checked(service)
 
 
-@pytest.mark.skipif(not hasattr(signal, "SIGSTOP"), reason="requires POSIX process suspension")
-def test_coalesced_waiter_expiries_release_each_callback_once(tmp_path, monkeypatch):
-    service, port = deadline_service(tmp_path, budget=2)
-    started = []
-    original = http_server.app.view_functions["oauth_token"]
-
-    def token_receiver():
-        started.append(time.monotonic())
-        return original()
-
-    monkeypatch.setitem(http_server.app.view_functions, "oauth_token", token_receiver)
-    try:
-        service.start()
-        http_server.configure_oauth_token_response(delay_seconds=8)
-        submit(port, 0)
-        wait(service, lambda: started, "refresh owner")
-        for chunk_id in range(1, 8):
-            submit(port, chunk_id)
-            time.sleep(0.003)
-        wait(service, lambda: time.monotonic() - started[0] >= 1.5,
-             "pause before request expiries")
-        service.flb.send_signal(signal.SIGSTOP)
-        try:
-            # Coalesce periodic wakeups and all expiry events in one ready batch.
-            time.sleep(0.8)
-        finally:
-            service.flb.send_signal(signal.SIGCONT)
-        wait(service, lambda: dropped_callbacks(service, 8), "all coalesced expiries")
-        assert Path(service.flb.log_file).read_text().count("is not retried (no retry config)") == 8
-        assert metrics(service)["proc_records"] == 0
-        assert len(started) == 1
-        http_server.configure_oauth_token_response(delay_seconds=0)
-        submit(port, 8)
-        wait(service, lambda: metrics(service)["proc_records"] == 1, "post-expiry recovery")
-    finally:
-        stop_checked(service)
-
-
-# HTTP status headers and periodic bytes are progress, not permission to reset the budget.
+# Native response timeout starts after upload; response bytes do not reset it.
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
 @pytest.mark.parametrize("mode", ["blocked", "trickle"])
-def test_response_progress_does_not_extend_attempt(tmp_path, monkeypatch, stage, mode):
-    service, port = deadline_service(tmp_path)
+def test_response_progress_does_not_extend_response_timeout(tmp_path, monkeypatch, stage, mode):
+    service, port = timeout_service(tmp_path)
     started = []
     original = http_server.app.view_functions["oauth_token"]
 
@@ -253,10 +206,10 @@ def test_response_progress_does_not_extend_attempt(tmp_path, monkeypatch, stage,
         submit(port, 0)
         wait(service, lambda: started, "initial OAuth")
         wait(service, lambda: dropped_callbacks(service, 1),
-             "blocked or trickling response expires", timeout=5.7)
+             "blocked or trickling response times out", timeout=8)
         elapsed = time.monotonic() - started[0]
         logging.getLogger(__name__).info("response stage=%s mode=%s elapsed=%.3fs", stage, mode, elapsed)
-        assert 4.5 <= elapsed < 5.7
+        assert 4 <= elapsed < 8
         assert metrics(service)["proc_records"] == 0
         assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
                               dcr_id="dcr-suite", status="200") == 0
@@ -283,7 +236,7 @@ class WireReceiver:
             def handle(self):
                 receiver.accepted.append(time.monotonic())
                 if receiver.first_close and len(receiver.accepted) == 1:
-                    return  # Failure before deadline must retain OAuth's second getter.
+                    return  # Early connection failure must retain OAuth's second getter.
                 self.request.settimeout(10)
                 if receiver.mode == "tls":
                     self.request.recv(4096)  # ClientHello; never send ServerHello.
@@ -374,10 +327,21 @@ class KeepaliveReceiver:
                                         first = len(receiver.requests) == 1
                                     if first and failure == "malformed":
                                         # Invalid chunk length fails the HTTP parser immediately,
-                                        # without EOF, a socket error, or a deadline cancellation.
+                                        # without EOF, a socket error, or a timeout.
                                         connection.sendall(
                                             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                                             b"Connection: keep-alive\r\n\r\nnot-hex\r\n")
+                                        continue
+                                    if first and failure == "incomplete_token":
+                                        # Valid JSON is not a complete HTTP response. The declared
+                                        # body has a missing byte, followed by EOF from the peer.
+                                        payload = json.dumps({"access_token": "partial-token",
+                                                              "token_type": "Bearer",
+                                                              "expires_in": 300}).encode()
+                                        connection.sendall(
+                                            (f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload) + 1}\r\n"
+                                             "Connection: keep-alive\r\n\r\n").encode() + payload)
+                                        connection.shutdown(socket.SHUT_WR)
                                         continue
                                     if not first:
                                         if not receiver.release_retry.wait(15):
@@ -429,10 +393,10 @@ class KeepaliveReceiver:
 @pytest.mark.parametrize("stage,failure", [
     ("oauth", "malformed"), ("ingestion", "malformed"),
     ("oauth", "http_error"), ("ingestion", "http_error"),
-    ("oauth", "invalid_token"),
+    ("oauth", "invalid_token"), ("oauth", "incomplete_token"),
 ])
 def test_failed_exchange_connection_disposition_and_engine_recovery(tmp_path, stage, failure):
-    service, port = deadline_service(tmp_path)
+    service, port = timeout_service(tmp_path)
     receiver = KeepaliveReceiver(service, failure, use_tls=stage == "ingestion")
     # OAuth uses its own trust context, not the output's test CA configuration.
     endpoint = (f"http://127.0.0.1:{receiver.port}" if stage == "oauth"
@@ -445,7 +409,7 @@ def test_failed_exchange_connection_disposition_and_engine_recovery(tmp_path, st
         service.start()
         submit(port, 0)
         wait(service, lambda: len(receiver.requests) >= 1, "first wire request")
-        # The parser/HTTP failure must return promptly, not wait for the 5s deadline.
+        # The parser/HTTP failure must return promptly, not wait for the 5s timeout.
         # The second request is the engine retry: no second input record is submitted.
         wait(service, lambda: len(receiver.requests) >= 2,
              "engine retry after completed or malformed response", timeout=3.5)
@@ -514,7 +478,8 @@ def set_output(service, **values):
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
 @pytest.mark.parametrize("first_close", [False, True])
 def test_tls_acquisition_and_oauth_fallback_are_bounded(tmp_path, stage, first_close):
-    service, port = deadline_service(tmp_path)
+    service, port = timeout_service(tmp_path)
+    set_output(service, **{"net.connect_timeout": "2s"})
     receiver = WireReceiver(service, "tls", first_close=first_close)
     set_output(service, **{("auth_url" if stage == "oauth" else "dce_url"):
                            f"https://localhost:{receiver.port}/oauth/token" if stage == "oauth"
@@ -524,26 +489,24 @@ def test_tls_acquisition_and_oauth_fallback_are_bounded(tmp_path, stage, first_c
         start = time.monotonic()
         submit(port, 0)
         wait(service, lambda: receiver.accepted, "TLS client hello")
-        wait(service, lambda: dropped_callbacks(service, 1), "TLS callback bounded", timeout=5.7)
+        wait(service, lambda: dropped_callbacks(service, 1),
+             "TLS callback bounded by native connect timeout and fallback", timeout=8)
         elapsed = time.monotonic() - start
-        log = Path(service.flb.log_file).read_text()
         logging.getLogger(__name__).info("TLS stage=%s first_close=%s elapsed=%.3fs accepts=%s",
                                          stage, first_close, elapsed,
                                          [round(t - start, 3) for t in receiver.accepted])
-        assert elapsed < 5.8
+        assert elapsed < 8
         assert metrics(service)["proc_records"] == 0
         if stage == "oauth" and first_close:
             assert len(receiver.accepted) == 2  # Early failure still calls the second getter.
-        assert all(t - start < 5.1 for t in receiver.accepted)
-        assert "result=2" in log
     finally:
         receiver.close()
         stop_checked(service)
 
 
-@pytest.mark.parametrize("mode", ["blocked", "trickle"])
-def test_upload_progress_does_not_extend_attempt(tmp_path, mode):
-    service, port = deadline_service(tmp_path)
+def test_stalled_upload_uses_native_io_timeout(tmp_path):
+    mode = "blocked"
+    service, port = timeout_service(tmp_path)
     receiver = WireReceiver(service, mode)
     set_output(service, dce_url=f"https://localhost:{receiver.port}", compress=False)
     path = Path(service.service.config_path)
@@ -557,11 +520,11 @@ def test_upload_progress_does_not_extend_attempt(tmp_path, mode):
         response.raise_for_status()
         wait(service, lambda: receiver.uploads, "TLS upload headers")
         started = receiver.accepted[0]
-        wait(service, lambda: dropped_callbacks(service, 1), "upload callback expired", timeout=5.7)
+        wait(service, lambda: dropped_callbacks(service, 1), "stalled upload times out", timeout=8)
         elapsed = time.monotonic() - started
         upload = receiver.uploads[0]
         logging.getLogger(__name__).info("upload mode=%s elapsed=%.3fs received=%s", mode, elapsed, upload)
-        assert elapsed < 5.7
+        assert elapsed < 8
         assert 0 < upload["received"] < upload["length"]
         assert metrics(service)["proc_records"] == 0
         assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
@@ -575,7 +538,7 @@ def test_upload_progress_does_not_extend_attempt(tmp_path, mode):
 
 
 def test_refresh_contention_after_a_real_cached_token_expires(tmp_path, monkeypatch):
-    service, port = deadline_service(tmp_path)
+    service, port = timeout_service(tmp_path)
     token_times = []
     original = http_server.app.view_functions["oauth_token"]
 
@@ -600,50 +563,26 @@ def test_refresh_contention_after_a_real_cached_token_expires(tmp_path, monkeypa
         submit(port, 1)
         wait(service, lambda: len(token_times) == 2, "expired-token refresh owner")
         submit(port, 2)
-        wait(service, lambda: dropped_callbacks(service, 2), "both budgets expire", timeout=5.7)
-        elapsed = time.monotonic() - token_times[1]
-        logging.getLogger(__name__).info("actual expiry contention elapsed=%.3fs refreshes=%s", elapsed,
-                                         len(token_times) - 1)
-        assert elapsed < 5.7
+        wait(service, lambda: metrics(service)["proc_records"] == 3,
+             "refreshed concurrent requests complete independently", timeout=9)
         assert len(token_times) == 2
-        assert metrics(service)["proc_records"] == 1
+        assert not dropped_callbacks(service, 1)
         ingestion = [r for r in http_server.data_storage["requests"]
                      if r["path"].startswith("/dataCollectionRules/")]
         assert len(ingestion) == 3
         assert all(r["headers"]["Authorization"] == "Bearer refreshed" for r in ingestion[1:])
         http_server.configure_http_response(delay_seconds=0)
         submit(port, 3)
-        wait(service, lambda: metrics(service)["proc_records"] == 2, "refreshed-token recovery")
+        wait(service, lambda: metrics(service)["proc_records"] == 4, "refreshed-token recovery")
         assert len(token_times) == 2
-    finally:
-        stop_checked(service)
-
-
-@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux epoll timerfd regression")
-def test_fractional_second_start_does_not_shorten_one_shot(tmp_path):
-    import re
-    service, port = deadline_service(tmp_path, budget=2)
-    try:
-        service.start()
-        http_server.configure_http_response(hang_before_response=True)
-        for index in range(3):
-            wait(service, lambda: 0.4 < time.monotonic() % 1 < 0.5,
-                 "fractional-second start", timeout=2)
-            submit(port, index)
-            wait(service, lambda: dropped_callbacks(service, index + 1),
-                 "fractional-start attempt expired", timeout=2.7)
-        elapsed = [int(ms) for ms in re.findall(r"send attempt finished elapsed_ms=(\d+)",
-                                               Path(service.flb.log_file).read_text())]
-        logging.getLogger(__name__).info("fractional-start elapsed_ms=%s", elapsed)
-        assert len(elapsed) == 3
-        assert all(1990 <= ms < 2700 for ms in elapsed)
     finally:
         stop_checked(service)
 
 
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
 def test_full_listen_queue_bounds_connect_without_accept(tmp_path, stage):
-    service, port = deadline_service(tmp_path)
+    service, port = timeout_service(tmp_path)
+    set_output(service, **{"net.connect_timeout": "2s"})
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -665,13 +604,57 @@ def test_full_listen_queue_bounds_connect_without_accept(tmp_path, stage):
         service.start()
         start = time.monotonic()
         submit(port, 0)
-        wait(service, lambda: dropped_callbacks(service, 1), "connect callback bounded", timeout=5.7)
+        wait(service, lambda: dropped_callbacks(service, 1),
+             "connect callback bounded including OAuth fallback", timeout=8)
         elapsed = time.monotonic() - start
         logging.getLogger(__name__).info("connect stage=%s elapsed=%.3fs stalled_peers=%s", stage, elapsed, stalled)
-        assert elapsed < 5.8
+        assert elapsed < 8
         assert metrics(service)["proc_records"] == 0
     finally:
         for peer in peers:
             peer.close()
         listener.close()
+        stop_checked(service)
+
+
+@pytest.mark.parametrize("stage", ["oauth", "ingestion"])
+def test_native_io_timeout_clamps_response_timeout(tmp_path, stage):
+    service, port = timeout_service(tmp_path, response_timeout="10s")
+    set_output(service, **{"net.io_timeout": "1s"})
+    configure = (http_server.configure_oauth_token_response if stage == "oauth"
+                 else http_server.configure_http_response)
+    try:
+        service.start()
+        configure(hang_before_response=True)
+        started = time.monotonic()
+        submit(port, 0)
+        wait(service, lambda: dropped_callbacks(service, 1), "native idle timeout", timeout=4)
+        assert time.monotonic() - started < 4  # Not the 10s response setting.
+        assert metrics(service)["proc_records"] == 0
+        assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
+                              dcr_id="dcr-suite", status="200") == 0
+        configure(hang_before_response=False)
+        submit(port, 1)
+        wait(service, lambda: metrics(service)["proc_records"] == 1, "idle-timeout recovery")
+    finally:
+        stop_checked(service)
+
+
+@pytest.mark.parametrize("response_timeout", [None, "2s"])
+@pytest.mark.parametrize("batching", [False, True])
+def test_response_timeout_configuration_with_default(tmp_path, response_timeout, batching):
+    service, port = timeout_service(tmp_path, response_timeout=response_timeout)
+    if not batching:
+        path = Path(service.service.config_path)
+        config = yaml.safe_load(path.read_text())
+        output = config["pipeline"]["outputs"][0]
+        del output["batch_chunk_count"]
+        del output["batch_wait_ms"]
+        path.write_text(yaml.safe_dump(config))
+    try:
+        service.start()
+        submit(port, 0)
+        wait(service, lambda: metrics(service)["proc_records"] == 1,
+             "default or explicit timeout with or without batching")
+    finally:
         stop_checked(service)

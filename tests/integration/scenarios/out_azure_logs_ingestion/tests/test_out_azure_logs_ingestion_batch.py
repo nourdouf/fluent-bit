@@ -180,15 +180,12 @@ def test_partial_batch_uses_first_member_deadline(tmp_path, monkeypatch, count):
 
 
 @pytest.mark.parametrize("status", [500, 413])
-@pytest.mark.parametrize("http_timeout", [None, 10])
-def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status, http_timeout):
+def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status):
     service = batch_service(tmp_path, wait_ms=3000)
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"].update({"scheduler.base": 1, "scheduler.cap": 1})
     config["pipeline"]["outputs"][0]["retry_limit"] = 1
-    if http_timeout is not None:
-        config["pipeline"]["outputs"][0]["http_timeout"] = http_timeout
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch)
     try:
@@ -227,6 +224,7 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     {"batch_chunk_count": 3, "batch_wait_ms": "1000junk"},
     {"batch_chunk_count": 3, "batch_wait_ms": 1000, "workers": 1},
     {"batch_chunk_count": 3, "batch_wait_ms": 1000, "workers": 2},
+    {"batch_chunk_count": 3, "batch_wait_ms": 1000, "http_timeout": 5},
 ])
 def test_batch_configuration_rejected_before_suspension(tmp_path, options):
     import subprocess
@@ -252,7 +250,10 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
     (tmp_path / "startup.log").write_text(report)
     logging.getLogger(__name__).info("startup check options=%s exit=%s report=%s",
                                      options, result.returncode, tmp_path / "startup.log")
-    assert "batching requires positive batch_chunk_count and batch_wait_ms and workers=0" in report
+    if "http_timeout" in options:
+        assert "unknown configuration property 'http_timeout'" in report
+    else:
+        assert "batching requires positive batch_chunk_count and batch_wait_ms and workers=0" in report
     if leaks_enabled():
         # Leaks reports its own status, independently of the expected startup rejection.
         assert result.returncode == 0, report
