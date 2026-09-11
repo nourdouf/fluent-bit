@@ -340,6 +340,8 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     {"batch_chunk_count": 3, "batch_wait_ms": -1},
     {"batch_chunk_count": "999999999999999999999", "batch_wait_ms": 1000},
     {"batch_chunk_count": 3, "batch_wait_ms": "1000junk"},
+    pytest.param({"batch_chunk_count": 3, "batch_wait_ms": 1000, "workers": -1},
+                 id="negative-workers"),
     {"batch_chunk_count": 3, "batch_wait_ms": 1000, "workers": 1},
     {"batch_chunk_count": 3, "batch_wait_ms": 1000, "workers": 2},
     {"batch_chunk_count": 3, "batch_wait_ms": 1000, "http_timeout": 5},
