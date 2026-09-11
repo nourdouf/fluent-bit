@@ -6,6 +6,8 @@ import time
 import logging
 import datetime
 import re
+import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -91,6 +93,122 @@ class Gates:
         self.closing.set()
         for item in self.requests:
             item["gate"].set()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux engine drain semantics")
+@pytest.mark.parametrize("transition", ["stop", "reload"])
+@pytest.mark.parametrize("pending", ["collecting", "ingestion", "oauth"])
+def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pending, transition):
+    service = batch_service(tmp_path, count=0, wait_ms=60000)
+    port = service.service.allocate_port_env("TEST_LIFECYCLE_INPUT_PORT")
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"].update({"flush": 0.05, "grace": 8, "hot_reload": "on"})
+    # Leave hot_reload.ensure_thread_safety at its default (on).
+    config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    token_started = threading.Event()
+    token_release = threading.Event()
+    token_requests = []
+    original_token = http_server.app.view_functions["oauth_token"]
+
+    def token_receiver():
+        token_requests.append(time.monotonic())
+        token_started.set()
+        if not token_release.wait(30):
+            gates.errors.append("token response gate expired")
+        return original_token()
+
+    def log_text():
+        return Path(service.flb.log_file).read_text()
+
+    def wait(predicate, description):
+        return service.service.wait_for_condition(
+            predicate, timeout=10, interval=0.02, description=description)
+
+    def submit(chunk_id):
+        response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
+                                 json={"chunk_id": chunk_id}, timeout=2)
+        response.raise_for_status()
+
+    def post_reload_delivered():
+        try:
+            return metrics(service)["proc_records"] == 3
+        except requests.HTTPError as error:
+            # The new HTTP server returns 404 until its first metrics snapshot.
+            if error.response is not None and error.response.status_code == 404:
+                return False
+            raise
+
+    monkeypatch.setitem(http_server.app.view_functions, "oauth_token", token_receiver)
+    if pending != "oauth":
+        token_release.set()
+    # Nine chunks close three batches: one refresh owner and two waiting senders.
+    count = {"collecting": 2, "ingestion": 3, "oauth": 9}[pending]
+    expected = collections.Counter(range(count))
+    try:
+        service.start()
+        first_submit = time.monotonic()
+        for chunk_id in range(count):
+            submit(chunk_id)
+            wait(lambda: len(re.findall(r"\[task\] created task=.* OK", log_text()))
+                 == chunk_id + 1, f"engine task for chunk {chunk_id}")
+        if pending == "ingestion":
+            gates.wait(service, 1)
+            assert len(gates.requests) == 1
+        elif pending == "oauth":
+            wait(token_started.is_set, "refresh owner held in OAuth")
+            assert len(token_requests) == 1
+            assert not gates.requests
+        else:
+            assert not gates.requests
+            assert not token_requests
+        assert metrics(service)["proc_records"] == 0
+
+        if transition == "reload":
+            service.flb.send_sighup()
+        else:
+            service.flb.send_signal(signal.SIGTERM)
+        # Do not release either network gate until the old engine begins draining.
+        wait(lambda: "[engine] pausing all inputs.." in log_text(), "shutdown ingestion pause")
+        if transition == "reload":
+            assert "[reload] stop everything of the old context" in log_text()
+            assert "[reload] start everything" not in log_text()
+        if pending == "collecting":
+            item = gates.wait(service, 1)
+            assert collections.Counter(r["chunk_id"] for r in item["records"]) == expected
+            # The 60-second collection wait cannot account for this request.
+            assert time.monotonic() - first_submit < 30
+        token_release.set()
+        gates.release_all()
+
+        if transition == "reload":
+            service.flb.wait_for_hot_reload_count(1, timeout=30)
+            old_log = log_text().split("[reload] start everything", 1)[0]
+            assert old_log.count("http_status=200") == (count + 2) // 3
+            assert len(token_requests) == 1
+            assert collections.Counter(r["chunk_id"] for item in gates.requests
+                                       for r in item["records"]) == expected
+            # Fresh input/output contexts must still deliver after the old timers exit.
+            for chunk_id in range(100, 103):
+                submit(chunk_id)
+                expected[chunk_id] += 1
+            wait(post_reload_delivered, "post-reload delivery")
+    finally:
+        token_release.set()
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert collections.Counter(r["chunk_id"] for item in gates.requests
+                               for r in item["records"]) == expected
+    assert len(gates.requests) == (count + 2) // 3 + (transition == "reload")
+    assert len(token_requests) == 1 + (transition == "reload")
+    log = log_text()
+    assert log.count("http_status=200") == len(gates.requests)
+    assert "failed to flush chunk" not in log
+    assert "cannot be retried" not in log
+    assert "is not retried" not in log
 
 
 def test_three_chunks_wait_for_shared_response(tmp_path, monkeypatch):
