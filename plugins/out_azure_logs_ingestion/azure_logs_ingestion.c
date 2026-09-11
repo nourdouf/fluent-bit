@@ -17,6 +17,7 @@
  *  limitations under the License.
  */
 
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_oauth2.h>
@@ -349,10 +350,14 @@ token_cleanup:
 
 static uint64_t az_li_now_ms(void)
 {
+#ifdef FLB_SYSTEM_WINDOWS
+    return (uint64_t) GetTickCount64();
+#else
     struct timespec now;
 
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+#endif
 }
 
 /* Keep the manual client-credentials form, TLS context and OAuth parser/cache.
