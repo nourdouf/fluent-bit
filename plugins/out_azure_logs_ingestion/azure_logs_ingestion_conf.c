@@ -250,6 +250,11 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
     }
     flb_output_upstream_set(ctx->u_dce, ins);
 
+    /* Apply native timeout settings once, without copying ingestion keepalive
+     * or TLS configuration into the independent OAuth upstream. */
+    ctx->u_auth->u->base.net.connect_timeout = ctx->u_dce->base.net.connect_timeout;
+    ctx->u_auth->u->base.net.io_timeout = ctx->u_dce->base.net.io_timeout;
+
     flb_plg_info(ins, "dce_url='%s', dcr='%s', table='%s', stream='Custom-%s'",
                 ctx->dce_url, ctx->dcr_id, ctx->table_name, ctx->table_name);
 
