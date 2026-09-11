@@ -14,7 +14,7 @@ import yaml
 
 from server import http_server
 from test_out_azure_logs_ingestion_batch import (
-    batch_service, metrics, request_metric, RESPONSES, stop_checked,
+    batch_service, metrics, request_metric, RESPONSES, sized_record, stop_checked,
 )
 
 
@@ -27,7 +27,10 @@ def timeout_service(tmp_path, response_timeout="5s"):
     config["pipeline"]["inputs"] = [
         {"name": "http", "listen": "127.0.0.1", "port": port}]
     config["pipeline"]["outputs"][0].update(
-        {"batch_chunk_count": 1, "retry_limit": "no_retries"})
+        {"retry_limit": "no_retries"})
+    # batch_service uses generous gated-peer timeouts; these tests must exercise
+    # the native default when no explicit response timeout is requested.
+    config["pipeline"]["outputs"][0].pop("http.response_timeout", None)
     if response_timeout is not None:
         config["pipeline"]["outputs"][0]["http.response_timeout"] = response_timeout
     path.write_text(yaml.safe_dump(config))
@@ -36,7 +39,7 @@ def timeout_service(tmp_path, response_timeout="5s"):
 
 def submit(port, chunk_id):
     response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
-                             json={"chunk_id": chunk_id}, timeout=2)
+                             json=sized_record(chunk_id, field_size=60000), timeout=5)
     response.raise_for_status()
 
 
@@ -653,7 +656,6 @@ def test_response_timeout_configuration_with_default(tmp_path, response_timeout,
         path = Path(service.service.config_path)
         config = yaml.safe_load(path.read_text())
         output = config["pipeline"]["outputs"][0]
-        del output["batch_chunk_count"]
         del output["batch_wait_ms"]
         path.write_text(yaml.safe_dump(config))
     try:
