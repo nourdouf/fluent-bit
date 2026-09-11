@@ -77,14 +77,10 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
 
     mk_list_init(&ctx->parked);
     mk_list_init(&ctx->auth_waiters);
-    if (flb_output_get_property("batch_chunk_count", ins) ||
-        flb_output_get_property("batch_wait_ms", ins)) {
-        if (az_li_positive_option(flb_output_get_property("batch_chunk_count", ins),
-                                  &ctx->batch_chunk_count) != 0 ||
-            az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
+    if (flb_output_get_property("batch_wait_ms", ins)) {
+        if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
                                   &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
-            flb_plg_error(ins, "batching requires positive batch_chunk_count and batch_wait_ms "
-                              "and workers=0");
+            flb_plg_error(ins, "batching requires positive batch_wait_ms and workers=0");
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
@@ -459,6 +455,15 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_c
         if (ret == -1) {
             flb_plg_error(ctx->ins,
                           "cannot gzip payload, disabling compression");
+            final_payload = json_payload;
+            final_payload_size = json_payload_size;
+        }
+        else if (json_payload_size <= FLB_AZ_LI_MAX_BODY_BYTES &&
+                 final_payload_size > FLB_AZ_LI_MAX_BODY_BYTES) {
+            /* Compression must not turn a bounded JSON array into an oversized body. */
+            flb_free(final_payload);
+            final_payload = json_payload;
+            final_payload_size = json_payload_size;
         }
         else {
             is_compressed = FLB_TRUE;
@@ -564,6 +569,7 @@ cleanup:
 struct az_li_batch {
     struct mk_list members;
     int count;
+    size_t json_size;
     int references;
     int done;
     int result;
@@ -574,14 +580,17 @@ struct az_li_member {
     struct mk_list member_link;
     struct mk_list parked_link;
     struct az_li_batch *batch;
-    struct flb_event_chunk *chunk;
     struct flb_coro *coro;
     flb_sds_t formatted;
     int send;
 };
 
-static void az_li_batch_close(struct flb_az_li *ctx, struct az_li_member *sender)
+static void az_li_batch_close(struct flb_az_li *ctx)
 {
+    struct az_li_member *sender;
+
+    /* A published collecting batch always has a member. Never elect an incoming non-member. */
+    sender = mk_list_entry_first(&ctx->collecting->members, struct az_li_member, member_link);
     ctx->collecting = NULL;
     sender->send = FLB_TRUE;
 }
@@ -597,9 +606,7 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
 
     if (ctx->collecting && (az_li_now_ms() >= ctx->collecting->deadline ||
                            config->is_shutting_down)) {
-        member = mk_list_entry_first(&ctx->collecting->members,
-                                     struct az_li_member, member_link);
-        az_li_batch_close(ctx, member);
+        az_li_batch_close(ctx);
     }
 
     /* Detach ready entries before resuming. Each callback owns its membership
@@ -624,46 +631,17 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
     }
 }
 
-static flb_sds_t az_li_batch_format(struct flb_az_li *ctx, struct az_li_batch *batch)
+static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
 {
     struct mk_list *head;
     struct az_li_member *member;
     flb_sds_t combined = NULL;
-    size_t length;
     size_t interior;
-    size_t total = 2;
+    size_t total = batch->json_size;
     size_t offset = 1;
-    int have_records = FLB_FALSE;
-    int ret;
 
-    /* Retain formatted arrays only during assembly, then allocate the final copy
-     * once. Avoid SDS cat's signed-int length and repeated whole-body reallocs. */
-    mk_list_foreach(head, &batch->members) {
-        member = mk_list_entry(head, struct az_li_member, member_link);
-        ret = az_li_format(member->chunk->data, member->chunk->size,
-                           &member->formatted, &length, ctx, ctx->config);
-        if (ret != 0) {
-            goto cleanup;
-        }
-        if (length < 2 || member->formatted[0] != '[' ||
-            member->formatted[length - 1] != ']') {
-            goto cleanup;
-        }
-        interior = length - 2;
-        if (interior > 0) {
-            if (interior > SIZE_MAX - total) {
-                goto cleanup;
-            }
-            total += interior;
-            if (have_records) {
-                if (total == SIZE_MAX) {
-                    goto cleanup;
-                }
-                total++;
-            }
-            have_records = FLB_TRUE;
-        }
-    }
+    /* Consume the retained arrays, including on allocation failure. The callbacks
+     * keep engine chunk ownership, but no formatted arrays survive assembly. */
     /* SDS adds its allocation header and a NUL terminator. */
     if (total > SIZE_MAX - FLB_SDS_HEADER_SIZE - 1) {
         goto cleanup;
@@ -707,12 +685,13 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
 {
     struct flb_az_li *ctx = out_context;
     struct az_li_batch *batch;
+    struct az_li_batch *replacement = NULL;
     struct az_li_member member = {0};
     flb_sds_t payload = NULL;
     size_t size;
     int result;
 
-    if (ctx->batch_chunk_count == 0) {
+    if (ctx->batch_wait_ms == 0) {
         if (az_li_format(event_chunk->data, event_chunk->size, &payload, &size,
                          ctx, config) != 0) {
             FLB_OUTPUT_RETURN(FLB_ERROR);
@@ -721,40 +700,67 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(result);
     }
 
+    /* The callback owns its final array until admission; malformed chunks cannot
+     * poison an existing batch or leave a partially initialized member behind. */
+    if (az_li_format(event_chunk->data, event_chunk->size, &member.formatted, &size,
+                     ctx, config) != 0 || size < 2 || member.formatted[0] != '[' ||
+        member.formatted[size - 1] != ']') {
+        flb_sds_destroy(member.formatted);
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+    }
+
+    batch = ctx->collecting;
+    /* Collecting arrays are strictly below the ceiling. Empty arrays add no comma.
+     * An oversized singleton must also displace a batch containing only []. */
+    if (!batch || size > FLB_AZ_LI_MAX_BODY_BYTES ||
+        (size > 2 && size - 2 > FLB_AZ_LI_MAX_BODY_BYTES - batch->json_size -
+                               (batch->json_size > 2))) {
+        replacement = flb_calloc(1, sizeof(*replacement));
+        if (!replacement) {
+            flb_sds_destroy(member.formatted);
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+        mk_list_init(&replacement->members);
+        replacement->json_size = 2;
+        replacement->deadline = az_li_now_ms() + ctx->batch_wait_ms;
+    }
+
     /* Only callbacks parked by the plugin need polling; idle outputs need no timer. */
     if (!ctx->batch_timer &&
         flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
                                   10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
         flb_plg_error(ctx->ins, "cannot create batch timer");
+        flb_free(replacement);
+        flb_sds_destroy(member.formatted);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
-    batch = ctx->collecting;
-    if (!batch) {
-        batch = flb_calloc(1, sizeof(*batch));
-        if (!batch) {
-            FLB_OUTPUT_RETURN(FLB_RETRY);
+    if (replacement) {
+        if (batch) {
+            az_li_batch_close(ctx);
         }
-        mk_list_init(&batch->members);
-        batch->deadline = az_li_now_ms() + ctx->batch_wait_ms;
+        batch = replacement;
         ctx->collecting = batch;
     }
     member.batch = batch;
-    member.chunk = event_chunk;
     member.coro = flb_coro_get();
     mk_list_add(&member.member_link, &batch->members);
     batch->count++;
     batch->references++;
-    if (batch->count >= ctx->batch_chunk_count || az_li_now_ms() >= batch->deadline) {
-        az_li_batch_close(ctx, &member);
+    if (size > 2) {
+        batch->json_size += size - 2 + (batch->json_size > 2);
     }
-    else {
+    if (batch->json_size >= FLB_AZ_LI_MAX_BODY_BYTES ||
+        az_li_now_ms() >= batch->deadline || config->is_shutting_down) {
+        az_li_batch_close(ctx);
+    }
+    if (!member.send) {
         mk_list_add(&member.parked_link, &ctx->parked);
         flb_coro_yield(member.coro, FLB_FALSE);
     }
 
     if (member.send) {
-        payload = az_li_batch_format(ctx, batch);
+        payload = az_li_batch_format(batch);
         batch->result = payload ? az_li_send(ctx, payload, batch->count) : FLB_ERROR;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
         batch->done = FLB_TRUE;
@@ -824,16 +830,11 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_az_li, table_name),
      "The name of the custom log table, including '_CL' suffix"
     },
-    /* Both options are required to opt in; omission preserves single-chunk flushes. */
-    {
-     FLB_CONFIG_MAP_STR, "batch_chunk_count", NULL,
-     0, FLB_FALSE, 0,
-     "Positive whole-engine-chunk count; requires batch_wait_ms and workers=0."
-    },
+    /* Omission preserves single-chunk flushes. */
     {
      FLB_CONFIG_MAP_STR, "batch_wait_ms", NULL,
      0, FLB_FALSE, 0,
-     "Positive collection wait in milliseconds from the first chunk, not a network timeout."
+     "Positive collection wait in milliseconds from the first chunk; requires workers=0."
     },
     {
      FLB_CONFIG_MAP_TIME, "http.response_timeout", "5s",
