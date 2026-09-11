@@ -33,13 +33,32 @@
 #define FLB_AZ_LI_TLS_MODE          FLB_IO_TLS
 /* refresh token every 60 minutes */
 #define FLB_AZ_LI_TOKEN_TIMEOUT 3600
+/* Conservative service ceiling for both JSON and the selected HTTP body. */
+#define FLB_AZ_LI_MAX_BODY_BYTES 1000000
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_sds.h>
 
+#ifdef FLB_HAVE_METRICS
+#include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_counter.h>
+#endif
+
 /* Context structure for Azure Logs Ingestion API */
 struct flb_az_li {
+    /* Opt-in, whole callback chunks; used only on the main scheduler. */
+    int batch_wait_ms;
+    struct az_li_batch *collecting;
+    struct mk_list parked;
+    struct flb_sched_timer *batch_timer;
+
+    int response_timeout;
+    /* Coroutine single-flight token refresh, only for workers=0. */
+    int auth_refreshing;
+    struct mk_list auth_waiters;
+    struct flb_sched_timer *auth_wake_timer;
+
     /* log ingestion account setup */
     flb_sds_t tenant_id;
     flb_sds_t client_id;
@@ -66,6 +85,11 @@ struct flb_az_li {
     /* upstream connection to the data collection endpoint */
     struct flb_upstream *u_dce;
     flb_sds_t dce_u_url;
+
+#ifdef FLB_HAVE_METRICS
+    struct cmt_histogram *cmt_chunks_per_request;
+    struct cmt_counter *cmt_http_responses;
+#endif
 
     /* plugin output and config instance reference */
     struct flb_output_instance *ins;

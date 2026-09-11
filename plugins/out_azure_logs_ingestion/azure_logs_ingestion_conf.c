@@ -26,6 +26,44 @@
 #include "azure_logs_ingestion.h"
 #include "azure_logs_ingestion_conf.h"
 
+#ifdef FLB_HAVE_METRICS
+static void initialize_request_metrics(struct flb_az_li *ctx)
+{
+    struct cmt_histogram_buckets *buckets;
+    double boundaries[] = {1, 2, 3, 4, 8, 16, 32, 64};
+
+    /* Create with owned default buckets first: cmetrics can fail before taking
+     * ownership of supplied buckets. Replace them only after successful creation. */
+    ctx->cmt_chunks_per_request = cmt_histogram_create(
+            ctx->ins->cmt, "fluentbit", "azure_logs_ingestion", "chunks_per_request",
+            "Whole engine chunks per ingestion HTTP attempt, including retries.",
+            NULL, 2, (char *[]) {"name", "dcr_id"});
+    if (ctx->cmt_chunks_per_request) {
+        buckets = cmt_histogram_buckets_create_size(boundaries,
+                                                   sizeof(boundaries) / sizeof(boundaries[0]));
+        if (buckets) {
+            cmt_histogram_buckets_destroy(ctx->cmt_chunks_per_request->buckets);
+            ctx->cmt_chunks_per_request->buckets = buckets;
+        }
+        else {
+            cmt_histogram_destroy(ctx->cmt_chunks_per_request);
+            ctx->cmt_chunks_per_request = NULL;
+        }
+    }
+    if (!ctx->cmt_chunks_per_request) {
+        flb_plg_warn(ctx->ins, "chunks per request metric is unavailable");
+    }
+    ctx->cmt_http_responses = cmt_counter_create(
+            ctx->ins->cmt, "fluentbit", "azure_logs_ingestion", "http_responses_total",
+            "Completed ingestion HTTP responses; excludes transport errors and OAuth.",
+            3, (char *[]) {"name", "dcr_id", "status"});
+    if (!ctx->cmt_http_responses) {
+        flb_plg_warn(ctx->ins, "HTTP response metric is unavailable");
+    }
+    /* Successful instruments belong to ins->cmt, destroyed by the output core. */
+}
+#endif
+
 static int validate_auth_url_override(struct flb_output_instance *ins,
                                       flb_sds_t auth_url_override)
 {
@@ -186,6 +224,10 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
                     FLB_AZ_LI_DCE_URL_TMPLT, ctx->dce_url, 
                     ctx->dcr_id, ctx->table_name);
 
+#ifdef FLB_HAVE_METRICS
+    initialize_request_metrics(ctx);
+#endif
+
     /* Initialize the auth mutex */
     pthread_mutex_init(&ctx->token_mutex, NULL);
 
@@ -207,6 +249,11 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         return NULL;
     }
     flb_output_upstream_set(ctx->u_dce, ins);
+
+    /* Apply native timeout settings once, without copying ingestion keepalive
+     * or TLS configuration into the independent OAuth upstream. */
+    ctx->u_auth->u->base.net.connect_timeout = ctx->u_dce->base.net.connect_timeout;
+    ctx->u_auth->u->base.net.io_timeout = ctx->u_dce->base.net.io_timeout;
 
     flb_plg_info(ins, "dce_url='%s', dcr='%s', table='%s', stream='Custom-%s'",
                 ctx->dce_url, ctx->dcr_id, ctx->table_name, ctx->table_name);

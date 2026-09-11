@@ -17,6 +17,7 @@
  *  limitations under the License.
  */
 
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_oauth2.h>
@@ -30,9 +31,34 @@
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
+#include <fluent-bit/flb_scheduler.h>
+#include <fluent-bit/flb_coro.h>
+#include <fluent-bit/flb_upstream_conn.h>
+#include <time.h>
+#include <limits.h>
+#include <errno.h>
 
 #include "azure_logs_ingestion.h"
 #include "azure_logs_ingestion_conf.h"
+
+static void az_li_batch_tick(struct flb_config *config, void *data);
+
+static int az_li_positive_option(const char *value, int *result)
+{
+    char *end;
+    long parsed;
+
+    if (!value || !*value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno || *end || parsed <= 0 || parsed > INT_MAX) {
+        return -1;
+    }
+    *result = (int) parsed;
+    return 0;
+}
 
 static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
                           struct flb_config *config, void *data)
@@ -49,6 +75,21 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
         return -1;
     }
 
+    mk_list_init(&ctx->parked);
+    mk_list_init(&ctx->auth_waiters);
+    if (flb_output_get_property("batch_wait_ms", ins)) {
+        if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
+                                  &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
+            flb_plg_error(ins, "batching requires positive batch_wait_ms and workers=0");
+            flb_az_li_ctx_destroy(ctx);
+            return -1;
+        }
+    }
+    /* Only the main scheduler uses the coroutine refresh gate. Legacy worker
+     * instances retain synchronous OAuth and mutex-protected token access. */
+    if (ins->tp_workers == 0) {
+        flb_stream_enable_async_mode(&ctx->u_auth->u->base);
+    }
     return 0;
 }
 
@@ -163,19 +204,76 @@ static int az_li_format(const void *in_buf, size_t in_bytes,
     return 0;
 }
 
+/* Only refresh waiters are resumed here; network I/O resumes in the engine. */
+struct az_li_auth_waiter {
+    struct flb_coro *coro;
+    struct mk_list link;
+};
+
+static void az_li_auth_wake(struct flb_config *config, void *data)
+{
+    struct flb_az_li *ctx = data;
+    struct az_li_auth_waiter *waiter;
+    struct flb_coro *coro;
+
+    if (!ctx->auth_refreshing && mk_list_is_empty(&ctx->auth_waiters) != 0) {
+        waiter = mk_list_entry_first(&ctx->auth_waiters, struct az_li_auth_waiter, link);
+        coro = waiter->coro;
+        mk_list_del(&waiter->link);
+        flb_coro_resume(coro);
+    }
+    if (mk_list_is_empty(&ctx->auth_waiters) == 0) {
+        flb_sched_timer_cb_destroy(ctx->auth_wake_timer);
+        ctx->auth_wake_timer = NULL;
+    }
+}
+
+static int az_li_auth_acquire(struct flb_az_li *ctx)
+{
+    struct az_li_auth_waiter waiter;
+
+    waiter.coro = flb_coro_get();
+    while (ctx->auth_refreshing) {
+        if (!ctx->auth_wake_timer &&
+            flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
+                                      10, az_li_auth_wake, ctx,
+                                      &ctx->auth_wake_timer) != 0) {
+            return -1;
+        }
+        mk_list_add(&waiter.link, &ctx->auth_waiters);
+        flb_coro_yield(waiter.coro, FLB_FALSE);
+    }
+    ctx->auth_refreshing = FLB_TRUE;
+    return 0;
+}
+
+static char *az_li_token_request(struct flb_az_li *ctx);
+
 /* Gets OAuth token; (allocates sds string everytime, must deallocate) */
-flb_sds_t get_az_li_token(struct flb_az_li *ctx)
+static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
 {
     int ret = 0;
+    int async = ctx->ins->tp_workers == 0;
+    int owns_refresh = FLB_FALSE;
     char* token;
     size_t token_len;
     flb_sds_t token_return = NULL;
 
-    if (pthread_mutex_lock(&ctx->token_mutex)) {
+    if (async) {
+        /* A cached-token copy cannot yield on the main scheduler. Refresh and
+         * payload mutation can, so wait before touching a refreshing cache. */
+        if (ctx->auth_refreshing || flb_oauth2_token_expired(ctx->u_auth) == FLB_TRUE) {
+            if (az_li_auth_acquire(ctx) != 0) {
+                return NULL;
+            }
+            owns_refresh = FLB_TRUE;
+        }
+    }
+    else if (pthread_mutex_lock(&ctx->token_mutex)) {
         flb_plg_error(ctx->ins, "error locking mutex");
         return NULL;
     }
-    /* Retrieve access token only if expired */
+    /* Recheck after acquiring ownership: a preceding refresh may have filled the cache. */
     if (flb_oauth2_token_expired(ctx->u_auth) == FLB_TRUE) {
         flb_plg_debug(ctx->ins, "token expired. getting new token");
         /* Clear any previous oauth2 payload content */
@@ -209,7 +307,7 @@ flb_sds_t get_az_li_token(struct flb_az_li *ctx)
             goto token_cleanup;
         }
 
-        token = flb_oauth2_token_get(ctx->u_auth);
+        token = az_li_token_request(ctx);
 
         /* Copy string to prevent race conditions */
         if (!token) {
@@ -234,54 +332,117 @@ flb_sds_t get_az_li_token(struct flb_az_li *ctx)
                         ctx->u_auth->token_type, ctx->u_auth->access_token);
 
 token_cleanup:
-    if (pthread_mutex_unlock(&ctx->token_mutex)) {
+    if (owns_refresh) {
+        ctx->auth_refreshing = FLB_FALSE;
+    }
+    if (!async && pthread_mutex_unlock(&ctx->token_mutex)) {
         flb_plg_error(ctx->ins, "error unlocking mutex");
+        flb_sds_destroy(token_return);
         return NULL;
     }
 
     return token_return;
 }
 
-static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
-                           struct flb_output_flush *out_flush,
-                           struct flb_input_instance *i_ins,
-                           void *out_context,
-                           struct flb_config *config)
+static uint64_t az_li_now_ms(void)
+{
+#ifdef FLB_SYSTEM_WINDOWS
+    return (uint64_t) GetTickCount64();
+#else
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+#endif
+}
+
+/* Keep the manual client-credentials form, TLS context and OAuth parser/cache.
+ * The generic token helper can parse a partial 200 after flb_http_do fails;
+ * promote tokens only after a complete exchange. The caller owns refresh access. */
+static char *az_li_token_request(struct flb_az_li *ctx)
+{
+    struct flb_oauth2 *auth = ctx->u_auth;
+    struct flb_connection *conn = NULL;
+    struct flb_http_client *client = NULL;
+    int saved_flags = flb_stream_get_flags(&auth->u->base);
+    int index;
+    int ret;
+    size_t sent;
+    char *token = NULL;
+
+    for (index = 0; index < 2; index++) {
+        if (index == 1) {
+            flb_stream_enable_flags(&auth->u->base, FLB_IO_IPV6);
+        }
+        conn = flb_upstream_conn_get(auth->u);
+        if (conn) {
+            break;
+        }
+    }
+    if (!conn) {
+        /* A failed fallback must not discard an existing IPv6 preference.
+         * Keep a successful fallback's preference, like the OAuth helper. */
+        flb_stream_set_flags(&auth->u->base, saved_flags);
+        return NULL;
+    }
+    client = flb_http_client(conn, FLB_HTTP_POST, auth->uri,
+                             auth->payload, flb_sds_len(auth->payload),
+                             auth->host, atoi(auth->port), NULL, 0);
+    if (!client) {
+        goto cleanup;
+    }
+    flb_http_set_response_timeout(client, ctx->response_timeout);
+    ret = flb_http_add_header(client, FLB_HTTP_HEADER_CONTENT_TYPE,
+                              sizeof(FLB_HTTP_HEADER_CONTENT_TYPE) - 1,
+                              FLB_OAUTH2_HTTP_ENCODING, sizeof(FLB_OAUTH2_HTTP_ENCODING) - 1);
+    if (ret != 0) {
+        goto cleanup;
+    }
+    ret = flb_http_do(client, &sent);
+    if (ret != 0) {
+        goto cleanup;
+    }
+    /* Unlike a partial 200 response, a completed token response may refresh
+     * the cache. HTTP errors are never retried here. */
+    if (client->resp.status == 200 && client->resp.payload_size > 0 &&
+        flb_oauth2_parse_json_response(client->resp.payload,
+                                       client->resp.payload_size, auth) == 0) {
+        token = auth->access_token;
+    }
+
+cleanup:
+    if (client) {
+        flb_http_client_destroy(client);
+    }
+    /* OAuth never keeps a connection, even after a successful exchange. */
+    flb_upstream_conn_recycle(conn, FLB_FALSE);
+    flb_upstream_conn_release(conn);
+    return token;
+}
+
+/* The sender owns the copied JSON body; this helper returns only after cleanup. */
+static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_count)
 {
     int ret;
-    int flush_status;
+    int flush_status = FLB_RETRY;
     size_t b_sent;
-    size_t json_payload_size;
-    void* final_payload;
+    size_t json_payload_size = flb_sds_len(json_payload);
+    void *final_payload;
     size_t final_payload_size;
-    flb_sds_t token;
-    struct flb_connection *u_conn;
+    flb_sds_t token = NULL;
+    struct flb_connection *u_conn = NULL;
     struct flb_http_client *c = NULL;
     int is_compressed = FLB_FALSE;
-    flb_sds_t json_payload = NULL;
-    struct flb_az_li *ctx = out_context;
-    (void) i_ins;
-    (void) config;
+#ifdef FLB_HAVE_METRICS
+    char status[16];
+#endif
 
-    /* Get upstream connection */
-    u_conn = flb_upstream_conn_get(ctx->u_dce);
-    if (!u_conn) {
-        FLB_OUTPUT_RETURN(FLB_RETRY);
-    }
-
-    /* Convert binary logs into a JSON payload */
-    ret = az_li_format(event_chunk->data, event_chunk->size,
-                       &json_payload, &json_payload_size, ctx,
-                       config);
-    if (ret == -1) {
-        flb_upstream_conn_release(u_conn);
-        FLB_OUTPUT_RETURN(FLB_ERROR);
-    }
-
-    /* Get OAuth2 token */
     token = get_az_li_token(ctx);
     if (!token) {
-        flush_status = FLB_RETRY;
+        goto cleanup;
+    }
+    u_conn = flb_upstream_conn_get(ctx->u_dce);
+    if (!u_conn) {
         goto cleanup;
     }
 
@@ -294,6 +455,15 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         if (ret == -1) {
             flb_plg_error(ctx->ins,
                           "cannot gzip payload, disabling compression");
+            final_payload = json_payload;
+            final_payload_size = json_payload_size;
+        }
+        else if (json_payload_size <= FLB_AZ_LI_MAX_BODY_BYTES &&
+                 final_payload_size > FLB_AZ_LI_MAX_BODY_BYTES) {
+            /* Compression must not turn a bounded JSON array into an oversized body. */
+            flb_free(final_payload);
+            final_payload = json_payload;
+            final_payload_size = json_payload_size;
         }
         else {
             is_compressed = FLB_TRUE;
@@ -312,6 +482,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         goto cleanup;
     }
 
+    flb_http_set_response_timeout(c, ctx->response_timeout);
+
     /* Append headers */
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
@@ -321,9 +493,27 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
     flb_http_buffer_size(c, FLB_HTTP_DATA_SIZE_MAX);
 
+#ifdef FLB_HAVE_METRICS
+    if (ctx->cmt_chunks_per_request) {
+        cmt_histogram_observe(ctx->cmt_chunks_per_request, cfl_time_now(),
+                              (double) chunk_count,
+                              2, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id});
+    }
+#endif
     /* Execute rest call */
     ret = flb_http_do(c, &b_sent);
+#ifdef FLB_HAVE_METRICS
+    /* Only completed HTTP exchanges count. A transport error may leave a partial
+     * status in the client; deliberately exclude it rather than invent a response. */
+    if (ret == 0 && c->resp.status >= 100 && c->resp.status <= 599 && ctx->cmt_http_responses) {
+        snprintf(status, sizeof(status), "%i", c->resp.status);
+        cmt_counter_inc(ctx->cmt_http_responses, cfl_time_now(),
+                        3, (char *[]) {(char *) flb_output_name(ctx->ins), ctx->dcr_id, status});
+    }
+#endif
     if (ret != 0) {
+        /* Do not reuse a connection with an incomplete HTTP exchange. */
+        flb_upstream_conn_recycle(u_conn, FLB_FALSE);
         flb_plg_warn(ctx->ins, "http_do=%i", ret);
         flush_status = FLB_RETRY;
         goto cleanup;
@@ -371,7 +561,216 @@ cleanup:
     if (token) {
         flb_sds_destroy(token);
     }
-    FLB_OUTPUT_RETURN(flush_status);
+    return flush_status;
+}
+
+/* Membership borrows postprocessor chunks until every request outcome is published.
+ * Only the timer resumes plugin-parked callbacks, never a sender in network I/O. */
+struct az_li_batch {
+    struct mk_list members;
+    int count;
+    size_t json_size;
+    int references;
+    int done;
+    int result;
+    uint64_t deadline;
+};
+
+struct az_li_member {
+    struct mk_list member_link;
+    struct mk_list parked_link;
+    struct az_li_batch *batch;
+    struct flb_coro *coro;
+    flb_sds_t formatted;
+    int send;
+};
+
+static void az_li_batch_close(struct flb_az_li *ctx)
+{
+    struct az_li_member *sender;
+
+    /* A published collecting batch always has a member. Never elect an incoming non-member. */
+    sender = mk_list_entry_first(&ctx->collecting->members, struct az_li_member, member_link);
+    ctx->collecting = NULL;
+    sender->send = FLB_TRUE;
+}
+
+static void az_li_batch_tick(struct flb_config *config, void *data)
+{
+    struct flb_az_li *ctx = data;
+    struct az_li_member *member;
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct mk_list ready;
+    struct flb_coro *coro;
+
+    if (ctx->collecting && (az_li_now_ms() >= ctx->collecting->deadline ||
+                           config->is_shutting_down)) {
+        az_li_batch_close(ctx);
+    }
+
+    /* Detach ready entries before resuming. Each callback owns its membership
+     * reference, so resuming one cannot free another entry in this local list. */
+    mk_list_init(&ready);
+    mk_list_foreach_safe(head, tmp, &ctx->parked) {
+        member = mk_list_entry(head, struct az_li_member, parked_link);
+        if (member->send || member->batch->done) {
+            mk_list_del(&member->parked_link);
+            mk_list_add(&member->parked_link, &ready);
+        }
+    }
+    while (mk_list_is_empty(&ready) != 0) {
+        member = mk_list_entry_first(&ready, struct az_li_member, parked_link);
+        coro = member->coro;
+        mk_list_del(&member->parked_link);
+        flb_coro_resume(coro);
+    }
+    if (mk_list_is_empty(&ctx->parked) == 0) {
+        flb_sched_timer_cb_destroy(ctx->batch_timer);
+        ctx->batch_timer = NULL;
+    }
+}
+
+static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
+{
+    struct mk_list *head;
+    struct az_li_member *member;
+    flb_sds_t combined = NULL;
+    size_t interior;
+    size_t total = batch->json_size;
+    size_t offset = 1;
+
+    /* Consume the retained arrays, including on allocation failure. The callbacks
+     * keep engine chunk ownership, but no formatted arrays survive assembly. */
+    /* SDS adds its allocation header and a NUL terminator. */
+    if (total > SIZE_MAX - FLB_SDS_HEADER_SIZE - 1) {
+        goto cleanup;
+    }
+    combined = flb_sds_create_size(total);
+    if (!combined) {
+        goto cleanup;
+    }
+    combined[0] = '[';
+    mk_list_foreach(head, &batch->members) {
+        member = mk_list_entry(head, struct az_li_member, member_link);
+        interior = flb_sds_len(member->formatted) - 2;
+        if (interior > 0) {
+            if (offset > 1) {
+                combined[offset++] = ',';
+            }
+            memcpy(combined + offset, member->formatted + 1, interior);
+            offset += interior;
+        }
+    }
+    combined[offset++] = ']';
+    combined[offset] = '\0';
+    flb_sds_len_set(combined, offset);
+
+cleanup:
+    mk_list_foreach(head, &batch->members) {
+        member = mk_list_entry(head, struct az_li_member, member_link);
+        if (member->formatted) {
+            flb_sds_destroy(member->formatted);
+            member->formatted = NULL;
+        }
+    }
+    return combined;
+}
+
+static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
+                           struct flb_output_flush *out_flush,
+                           struct flb_input_instance *i_ins,
+                           void *out_context,
+                           struct flb_config *config)
+{
+    struct flb_az_li *ctx = out_context;
+    struct az_li_batch *batch;
+    struct az_li_batch *replacement = NULL;
+    struct az_li_member member = {0};
+    flb_sds_t payload = NULL;
+    size_t size;
+    int result;
+
+    if (ctx->batch_wait_ms == 0) {
+        if (az_li_format(event_chunk->data, event_chunk->size, &payload, &size,
+                         ctx, config) != 0) {
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
+        result = az_li_send(ctx, payload, 1);
+        FLB_OUTPUT_RETURN(result);
+    }
+
+    /* The callback owns its final array until admission; malformed chunks cannot
+     * poison an existing batch or leave a partially initialized member behind. */
+    if (az_li_format(event_chunk->data, event_chunk->size, &member.formatted, &size,
+                     ctx, config) != 0 || size < 2 || member.formatted[0] != '[' ||
+        member.formatted[size - 1] != ']') {
+        flb_sds_destroy(member.formatted);
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+    }
+
+    batch = ctx->collecting;
+    /* Collecting arrays are strictly below the ceiling. Empty arrays add no comma.
+     * An oversized singleton must also displace a batch containing only []. */
+    if (!batch || size > FLB_AZ_LI_MAX_BODY_BYTES ||
+        (size > 2 && size - 2 > FLB_AZ_LI_MAX_BODY_BYTES - batch->json_size -
+                               (batch->json_size > 2))) {
+        replacement = flb_calloc(1, sizeof(*replacement));
+        if (!replacement) {
+            flb_sds_destroy(member.formatted);
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+        mk_list_init(&replacement->members);
+        replacement->json_size = 2;
+        replacement->deadline = az_li_now_ms() + ctx->batch_wait_ms;
+    }
+
+    /* Only callbacks parked by the plugin need polling; idle outputs need no timer. */
+    if (!ctx->batch_timer &&
+        flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
+                                  10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
+        flb_plg_error(ctx->ins, "cannot create batch timer");
+        flb_free(replacement);
+        flb_sds_destroy(member.formatted);
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+
+    if (replacement) {
+        if (batch) {
+            az_li_batch_close(ctx);
+        }
+        batch = replacement;
+        ctx->collecting = batch;
+    }
+    member.batch = batch;
+    member.coro = flb_coro_get();
+    mk_list_add(&member.member_link, &batch->members);
+    batch->count++;
+    batch->references++;
+    if (size > 2) {
+        batch->json_size += size - 2 + (batch->json_size > 2);
+    }
+    if (batch->json_size >= FLB_AZ_LI_MAX_BODY_BYTES ||
+        az_li_now_ms() >= batch->deadline || config->is_shutting_down) {
+        az_li_batch_close(ctx);
+    }
+    if (!member.send) {
+        mk_list_add(&member.parked_link, &ctx->parked);
+        flb_coro_yield(member.coro, FLB_FALSE);
+    }
+
+    if (member.send) {
+        payload = az_li_batch_format(batch);
+        batch->result = payload ? az_li_send(ctx, payload, batch->count) : FLB_ERROR;
+        /* No peer may return until HTTP client, body and connection cleanup finishes. */
+        batch->done = FLB_TRUE;
+    }
+    result = batch->result;
+    mk_list_del(&member.member_link);
+    if (--batch->references == 0) {
+        flb_free(batch);
+    }
+    FLB_OUTPUT_RETURN(result);
 }
 
 static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
@@ -382,6 +781,12 @@ static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
         return 0;
     }
 
+    if (ctx->batch_timer) {
+        flb_sched_timer_cb_destroy(ctx->batch_timer);
+    }
+    if (ctx->auth_wake_timer) {
+        flb_sched_timer_cb_destroy(ctx->auth_wake_timer);
+    }
     flb_plg_debug(ctx->ins, "exiting logs ingestion plugin");
     flb_az_li_ctx_destroy(ctx);
     return 0;
@@ -424,6 +829,17 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_STR, "table_name", (char *)NULL,
      0, FLB_TRUE, offsetof(struct flb_az_li, table_name),
      "The name of the custom log table, including '_CL' suffix"
+    },
+    /* Omission preserves single-chunk flushes. */
+    {
+     FLB_CONFIG_MAP_STR, "batch_wait_ms", NULL,
+     0, FLB_FALSE, 0,
+     "Positive collection wait in milliseconds from the first chunk; requires workers=0."
+    },
+    {
+     FLB_CONFIG_MAP_TIME, "http.response_timeout", "5s",
+     0, FLB_TRUE, offsetof(struct flb_az_li, response_timeout),
+     "HTTP response timeout applied independently to OAuth and ingestion requests."
     },
     /* optional params */
     {
