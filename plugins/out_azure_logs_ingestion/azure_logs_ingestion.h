@@ -52,6 +52,13 @@ struct flb_az_li {
     struct mk_list parked;
     struct flb_sched_timer *batch_timer;
 
+    /* Local deadline experiment: workers=0, explicit budget only. */
+    int http_timeout;
+    struct az_li_attempt *auth_owner;
+    struct az_li_attempt *dce_owner;
+    struct mk_list attempt_waiters;
+    struct flb_sched_timer *attempt_wake_timer;
+
     /* log ingestion account setup */
     flb_sds_t tenant_id;
     flb_sds_t client_id;

@@ -31,7 +31,16 @@
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 #include <fluent-bit/flb_scheduler.h>
+#include <fluent-bit/flb_event_loop.h>
 #include <fluent-bit/flb_coro.h>
+#include <fluent-bit/flb_upstream_conn.h>
+#include <monkey/mk_core/mk_core_info.h>
+/* Only epoll owns timerfds; explicit poll/select/libevent backends use pipes. */
+#if defined(__linux__) && defined(MK_HAVE_TIMERFD_CREATE) && \
+    (defined(MK_EVENT_LOOP_EPOLL) || defined(FLB_EVENT_LOOP_AUTO_DISCOVERY))
+#define AZ_LI_HAVE_TIMERFD
+#include <sys/timerfd.h>
+#endif
 #include <time.h>
 #include <limits.h>
 #include <errno.h>
@@ -74,6 +83,7 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     }
 
     mk_list_init(&ctx->parked);
+    mk_list_init(&ctx->attempt_waiters);
     if (flb_output_get_property("batch_chunk_count", ins) ||
         flb_output_get_property("batch_wait_ms", ins)) {
         if (az_li_positive_option(flb_output_get_property("batch_chunk_count", ins),
@@ -85,6 +95,18 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
+    }
+    if (flb_output_get_property("http_timeout", ins)) {
+        if (az_li_positive_option(flb_output_get_property("http_timeout", ins),
+                                  &ctx->http_timeout) != 0 ||
+            ctx->http_timeout < 2 || ctx->http_timeout > INT_MAX / 1000 ||
+            ctx->batch_chunk_count == 0) {
+            flb_plg_error(ins, "http_timeout requires at least two seconds, batching, "
+                              "and workers=0");
+            flb_az_li_ctx_destroy(ctx);
+            return -1;
+        }
+        flb_stream_enable_async_mode(&ctx->u_auth->u->base);
     }
     return 0;
 }
@@ -200,8 +222,10 @@ static int az_li_format(const void *in_buf, size_t in_bytes,
     return 0;
 }
 
+static char *az_li_timed_token_get(struct az_li_attempt *attempt);
+
 /* Gets OAuth token; (allocates sds string everytime, must deallocate) */
-flb_sds_t get_az_li_token(struct flb_az_li *ctx)
+static flb_sds_t get_az_li_token(struct flb_az_li *ctx, struct az_li_attempt *attempt)
 {
     int ret = 0;
     char* token;
@@ -246,7 +270,7 @@ flb_sds_t get_az_li_token(struct flb_az_li *ctx)
             goto token_cleanup;
         }
 
-        token = flb_oauth2_token_get(ctx->u_auth);
+        token = attempt ? az_li_timed_token_get(attempt) : flb_oauth2_token_get(ctx->u_auth);
 
         /* Copy string to prevent race conditions */
         if (!token) {
@@ -279,34 +303,313 @@ token_cleanup:
     return token_return;
 }
 
+/* A send owns its timer and stack state until network-owned cleanup returns.
+ * Gate waiters alone may be resumed here; DNS and I/O always resume in the engine. */
+struct az_li_attempt {
+    struct flb_az_li *ctx;
+    struct flb_coro *coro;
+    uint64_t deadline;
+    int expired;
+    struct flb_sched_timer *timer;
+    struct az_li_attempt **gate;
+    struct mk_list wait_link;
+};
+
+static uint64_t az_li_now_ms(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int az_li_attempt_expired(struct az_li_attempt *attempt)
+{
+    return attempt->expired || az_li_now_ms() >= attempt->deadline;
+}
+
+static void az_li_attempt_expire(struct flb_config *config, void *data)
+{
+    struct az_li_attempt *attempt = data;
+    struct flb_az_li *ctx = attempt->ctx;
+    struct flb_upstream_queue *queue;
+    struct flb_upstream *upstreams[2] = {ctx->u_auth->u, ctx->u_dce};
+    struct flb_connection *conn;
+    struct mk_list *head;
+    int index;
+
+    attempt->timer = NULL; /* The scheduler destroys this one-shot after callback. */
+    attempt->expired = FLB_TRUE;
+    for (index = 0; index < 2; index++) {
+        queue = flb_upstream_queue_get(upstreams[index]);
+        mk_list_foreach(head, &queue->busy_queue) {
+            conn = mk_list_entry(head, struct flb_connection, _head);
+            if (conn->coroutine != attempt->coro) {
+                continue;
+            }
+            if (conn->net_error == -1) {
+                conn->net_error = ETIMEDOUT;
+            }
+            flb_upstream_conn_recycle(conn, FLB_FALSE);
+            flb_connection_unset_connection_timeout(conn);
+            flb_connection_unset_io_timeout(conn);
+            if (conn->fd > -1 && !conn->shutdown_flag) {
+                shutdown(conn->fd, SHUT_RDWR);
+                conn->shutdown_flag = FLB_TRUE;
+            }
+            if (MK_EVENT_IS_REGISTERED((&conn->event))) {
+                /* Queue the normal I/O wakeup without the global timeout sweep's
+                 * connection accounting. The lease is released by its callback. */
+                flb_event_load_bucket_queue_event(config->evl_bktq, &conn->event);
+            }
+        }
+    }
+}
+
+static void az_li_attempt_wake(struct flb_config *config, void *data)
+{
+    struct flb_az_li *ctx = data;
+    struct az_li_attempt *attempt;
+    struct flb_coro *coro;
+    struct mk_list *head;
+    struct mk_list *tmp;
+
+    mk_list_foreach_safe(head, tmp, &ctx->attempt_waiters) {
+        attempt = mk_list_entry(head, struct az_li_attempt, wait_link);
+        if (az_li_attempt_expired(attempt) || !*attempt->gate) {
+            coro = attempt->coro;
+            mk_list_del(&attempt->wait_link);
+            flb_coro_resume(coro);
+        }
+    }
+    if (mk_list_is_empty(&ctx->attempt_waiters) == 0) {
+        flb_sched_timer_cb_destroy(ctx->attempt_wake_timer);
+        ctx->attempt_wake_timer = NULL;
+    }
+}
+
+static int az_li_attempt_gate(struct az_li_attempt *attempt, struct az_li_attempt **owner)
+{
+    struct flb_az_li *ctx = attempt->ctx;
+
+    while (*owner && !az_li_attempt_expired(attempt)) {
+        if (!ctx->attempt_wake_timer &&
+            flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
+                                      10, az_li_attempt_wake, ctx,
+                                      &ctx->attempt_wake_timer) != 0) {
+            return -1;
+        }
+        attempt->gate = owner;
+        mk_list_add(&attempt->wait_link, &ctx->attempt_waiters);
+        flb_coro_yield(attempt->coro, FLB_FALSE);
+    }
+    if (az_li_attempt_expired(attempt)) {
+        return -1;
+    }
+    *owner = attempt;
+    return 0;
+}
+
+/* Connection acquisition may enter DNS even when a cached connection exists.
+ * Reserve the last second because the resolver API accepts only whole seconds. */
+static int az_li_attempt_connect_budget(struct az_li_attempt *attempt, int configured_timeout)
+{
+    uint64_t now;
+    uint64_t remaining;
+    int timeout;
+
+    now = az_li_now_ms();
+    if (attempt->expired || now >= attempt->deadline) {
+        return 0;
+    }
+    remaining = attempt->deadline - now;
+    if (remaining < 1000) {
+        return 0;
+    }
+#ifdef AZ_LI_HAVE_TIMERFD
+    /* The epoll DNS timer rounds its initial expiry down. A one-second connect
+     * budget becomes an immediately due sub-second DNS timer; use at least two. */
+    timeout = (int) ((remaining + 999) / 1000);
+    if (timeout < 2) {
+        timeout = 2;
+    }
+#else
+    timeout = (int) (remaining / 1000);
+#endif
+    if (configured_timeout > 0 && configured_timeout < timeout) {
+        timeout = configured_timeout;
+    }
+    return timeout;
+}
+
+/* The Azure flow supplies a manual client-credentials form. Keep its payload,
+ * TLS context, parser and token cache; own only the timed network roundtrip so
+ * the generic helper's IPv6 fallback cannot inherit a stale connect budget.
+ * The caller owns the refresh gate and token mutex throughout this operation. */
+static char *az_li_timed_token_get(struct az_li_attempt *attempt)
+{
+    struct flb_oauth2 *auth = attempt->ctx->u_auth;
+    struct flb_connection *conn = NULL;
+    struct flb_http_client *client = NULL;
+    int saved_timeout = auth->u->base.net.connect_timeout;
+    int saved_flags = flb_stream_get_flags(&auth->u->base);
+    int remaining;
+    int index;
+    int ret;
+    size_t sent;
+    char *token = NULL;
+
+    for (index = 0; index < 2; index++) {
+        remaining = az_li_attempt_connect_budget(attempt, saved_timeout);
+        if (remaining < 1) {
+            break;
+        }
+        if (index == 1) {
+            flb_stream_enable_flags(&auth->u->base, FLB_IO_IPV6);
+        }
+        auth->u->base.net.connect_timeout = remaining;
+        conn = flb_upstream_conn_get(auth->u);
+        auth->u->base.net.connect_timeout = saved_timeout;
+        if (conn) {
+            break;
+        }
+    }
+    if (!conn) {
+        /* A failed fallback must not discard an existing IPv6 preference.
+         * Keep a successful fallback's preference, like the OAuth helper. */
+        flb_stream_set_flags(&auth->u->base, saved_flags);
+        return NULL;
+    }
+    if (az_li_attempt_expired(attempt)) {
+        goto cleanup;
+    }
+    client = flb_http_client(conn, FLB_HTTP_POST, auth->uri,
+                             auth->payload, flb_sds_len(auth->payload),
+                             auth->host, atoi(auth->port), NULL, 0);
+    if (!client) {
+        goto cleanup;
+    }
+    ret = flb_http_add_header(client, FLB_HTTP_HEADER_CONTENT_TYPE,
+                              sizeof(FLB_HTTP_HEADER_CONTENT_TYPE) - 1,
+                              FLB_OAUTH2_HTTP_ENCODING, sizeof(FLB_OAUTH2_HTTP_ENCODING) - 1);
+    if (ret != 0 || az_li_attempt_expired(attempt)) {
+        goto cleanup;
+    }
+    ret = flb_http_do(client, &sent);
+    if (ret != 0) {
+        /* A failed exchange may leave unread response bytes or a partial request. */
+        flb_upstream_conn_recycle(conn, FLB_FALSE);
+        goto cleanup;
+    }
+    /* Unlike a partial 200 response, a completed token response may refresh
+     * the cache. HTTP errors are never retried here. */
+    if (client->resp.status == 200 && client->resp.payload_size > 0 &&
+        flb_oauth2_parse_json_response(client->resp.payload,
+                                       client->resp.payload_size, auth) == 0) {
+        token = auth->access_token;
+    }
+
+cleanup:
+    if (client) {
+        flb_http_client_destroy(client);
+    }
+    flb_connection_unset_connection_timeout(conn);
+    flb_connection_unset_io_timeout(conn);
+    flb_upstream_conn_release(conn);
+    return token;
+}
+
+static int az_li_attempt_timer_start(struct az_li_attempt *attempt)
+{
+#ifdef AZ_LI_HAVE_TIMERFD
+    struct itimerspec expiration = {0};
+#endif
+
+    if (flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_ONESHOT,
+                                  attempt->ctx->http_timeout * 1000, az_li_attempt_expire,
+                                  attempt, &attempt->timer) != 0) {
+        return -1;
+    }
+#ifdef AZ_LI_HAVE_TIMERFD
+    /* Monkey's epoll initial timer expiry truncates nanoseconds. Rearm only
+     * this owned timer to the absolute monotonic deadline, not a rounded second.
+     * This backend coupling is experimental; other backends retain their API. */
+    expiration.it_value.tv_sec = attempt->deadline / 1000;
+    expiration.it_value.tv_nsec = (attempt->deadline % 1000) * 1000000;
+    if (timerfd_settime(attempt->timer->timer_fd, TFD_TIMER_ABSTIME, &expiration, NULL) != 0) {
+        flb_errno();
+        flb_sched_timer_cb_destroy(attempt->timer);
+        attempt->timer = NULL;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
 /* The sender owns the copied JSON body; this helper returns only after cleanup. */
 static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_count)
 {
     int ret;
-    int flush_status;
+    int flush_status = FLB_RETRY;
+    int connect_budget;
+    int saved_connect_timeout;
+    struct az_li_attempt attempt = {0};
     size_t b_sent;
     size_t json_payload_size = flb_sds_len(json_payload);
     void *final_payload;
     size_t final_payload_size;
     flb_sds_t token = NULL;
-    struct flb_connection *u_conn;
+    struct flb_connection *u_conn = NULL;
     struct flb_http_client *c = NULL;
     int is_compressed = FLB_FALSE;
 #ifdef FLB_HAVE_METRICS
     char status[16];
 #endif
 
-    u_conn = flb_upstream_conn_get(ctx->u_dce);
-    if (!u_conn) {
-        flb_sds_destroy(json_payload);
-        return FLB_RETRY;
+    if (ctx->http_timeout) {
+        attempt.ctx = ctx;
+        attempt.coro = flb_coro_get();
+        attempt.deadline = az_li_now_ms() + (uint64_t) ctx->http_timeout * 1000;
+        if (az_li_attempt_timer_start(&attempt) != 0) {
+            goto cleanup;
+        }
+        flb_plg_debug(ctx->ins, "send attempt started budget=%is", ctx->http_timeout);
+        /* Serialize BEFORE either blocking token lock, including cache copies. */
+        if (az_li_attempt_gate(&attempt, &ctx->auth_owner) != 0) {
+            goto cleanup;
+        }
+        token = get_az_li_token(ctx, &attempt);
+        ctx->auth_owner = NULL;
+        if (!token || az_li_attempt_expired(&attempt)) {
+            goto cleanup;
+        }
+        /* Auth precedes DCE acquisition. Only acquisition is serialized; HTTP
+         * exchanges continue concurrently after the shared net setting restores. */
+        if (az_li_attempt_gate(&attempt, &ctx->dce_owner) != 0) {
+            goto cleanup;
+        }
+        saved_connect_timeout = ctx->u_dce->base.net.connect_timeout;
+        connect_budget = az_li_attempt_connect_budget(&attempt, saved_connect_timeout);
+        if (connect_budget > 0) {
+            ctx->u_dce->base.net.connect_timeout = connect_budget;
+            u_conn = flb_upstream_conn_get(ctx->u_dce);
+        }
+        ctx->u_dce->base.net.connect_timeout = saved_connect_timeout;
+        ctx->dce_owner = NULL;
+        if (!u_conn || az_li_attempt_expired(&attempt)) {
+            goto cleanup;
+        }
     }
-
-    /* Get OAuth2 token */
-    token = get_az_li_token(ctx);
-    if (!token) {
-        flush_status = FLB_RETRY;
-        goto cleanup;
+    else {
+        /* Preserve omitted-option behavior, including synchronous OAuth. */
+        u_conn = flb_upstream_conn_get(ctx->u_dce);
+        if (!u_conn) {
+            goto cleanup;
+        }
+        token = get_az_li_token(ctx, NULL);
+        if (!token) {
+            goto cleanup;
+        }
     }
 
     /* Map buffer */
@@ -345,6 +648,9 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_c
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
     flb_http_buffer_size(c, FLB_HTTP_DATA_SIZE_MAX);
 
+    if (ctx->http_timeout && az_li_attempt_expired(&attempt)) {
+        goto cleanup;
+    }
 #ifdef FLB_HAVE_METRICS
     if (ctx->cmt_chunks_per_request) {
         cmt_histogram_observe(ctx->cmt_chunks_per_request, cfl_time_now(),
@@ -364,6 +670,10 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_c
     }
 #endif
     if (ret != 0) {
+        if (ctx->http_timeout) {
+            /* Do not reuse a connection with an incomplete HTTP exchange. */
+            flb_upstream_conn_recycle(u_conn, FLB_FALSE);
+        }
         flb_plg_warn(ctx->ins, "http_do=%i", ret);
         flush_status = FLB_RETRY;
         goto cleanup;
@@ -390,6 +700,14 @@ static int az_li_send(struct flb_az_li *ctx, flb_sds_t json_payload, int chunk_c
     }
 
 cleanup:
+    if (attempt.timer) {
+        flb_sched_timer_cb_destroy(attempt.timer);
+    }
+    if (ctx->http_timeout) {
+        flb_plg_debug(ctx->ins, "send attempt finished elapsed_ms=%" PRIu64 " result=%i",
+                     az_li_now_ms() + (uint64_t) ctx->http_timeout * 1000 - attempt.deadline,
+                     flush_status);
+    }
     /* cleanup */
     if (json_payload) {
         flb_sds_destroy(json_payload);
@@ -404,6 +722,10 @@ cleanup:
         flb_http_client_destroy(c);
     }
     if (u_conn) {
+        if (ctx->http_timeout) {
+            flb_connection_unset_connection_timeout(u_conn);
+            flb_connection_unset_io_timeout(u_conn);
+        }
         flb_upstream_conn_release(u_conn);
     }
 
@@ -434,14 +756,6 @@ struct az_li_member {
     flb_sds_t formatted;
     int send;
 };
-
-static uint64_t az_li_now_ms(void)
-{
-    struct timespec now;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
-}
 
 static void az_li_batch_close(struct flb_az_li *ctx, struct az_li_member *sender)
 {
@@ -641,6 +955,9 @@ static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
     if (ctx->batch_timer) {
         flb_sched_timer_cb_destroy(ctx->batch_timer);
     }
+    if (ctx->attempt_wake_timer) {
+        flb_sched_timer_cb_destroy(ctx->attempt_wake_timer);
+    }
     flb_plg_debug(ctx->ins, "exiting logs ingestion plugin");
     flb_az_li_ctx_destroy(ctx);
     return 0;
@@ -694,6 +1011,11 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_STR, "batch_wait_ms", NULL,
      0, FLB_FALSE, 0,
      "Positive collection wait in milliseconds from the first chunk, not a network timeout."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "http_timeout", NULL,
+     0, FLB_FALSE, 0,
+     "Experimental explicit send-attempt budget in seconds; no default."
     },
     /* optional params */
     {
