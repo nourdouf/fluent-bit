@@ -115,7 +115,7 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"].update({"flush": 0.05, "grace": 8, "hot_reload": "on"})
-    config["pipeline"]["outputs"][0]["time_generated"] = True
+    config["pipeline"]["outputs"][0].update({"time_generated": True, "batch_target_size": 1000000})
     # Leave hot_reload.ensure_thread_safety at its default (on).
     config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
     path.write_text(yaml.safe_dump(config))
@@ -245,13 +245,238 @@ def exact_size_record(chunk_id, array_bytes):
 
 
 @pytest.mark.parametrize("compress", ["off", "on"])
+def test_omitted_batch_target_uses_800000_bytes(tmp_path, monkeypatch, compress):
+    service = batch_service(tmp_path, count=2, wait_ms=4000)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    expected = {i: exact_size_record(i, 450001) for i in range(2)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    output = config["pipeline"]["outputs"][0]
+    output.update({"time_generated": True, "compress": compress})
+    assert "batch_target_size" not in output
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        first = gates.wait(service, 1)
+        # These arrays combine to 900001 bytes: valid at the old 1000000 ceiling,
+        # but not at the omitted option's new 800000-byte collection target.
+        assert first["json_size"] == 450001
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
+                                           timeout=15, description="default-target chunks delivered")
+        assert sorted(item["json_size"] for item in gates.requests) == [450001, 450001]
+        assert collections.Counter(record["chunk_id"] for item in gates.requests
+                                   for record in item["records"]) == {0: 1, 1: 1}
+        for item in gates.requests:
+            assert item["status"] == 200
+            assert item["raw_size"] <= 1000000
+            for record in item["records"]:
+                assert {key: value for key, value in record.items()
+                        if key != "@timestamp"} == expected[record["chunk_id"]]
+                assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z",
+                                    record["@timestamp"])
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+
+
+def assert_target_requests(gates, expected, sizes):
+    assert sorted(item["json_size"] for item in gates.requests) == sorted(sizes)
+    assert collections.Counter(record["chunk_id"] for item in gates.requests
+                               for record in item["records"]) == collections.Counter(expected.keys())
+    for item in gates.requests:
+        assert item["status"] == 200
+        assert item["raw_size"] <= 1000000
+        for record in item["records"]:
+            assert {key: value for key, value in record.items()
+                    if key != "@timestamp"} == expected[record["chunk_id"]]
+            assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z",
+                                record["@timestamp"])
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+@pytest.mark.parametrize("target,sizes,wait_ms", [
+    pytest.param(600000, [450001, 450001], 4000, id="smaller"),
+    pytest.param(1000000, [900001], 4000, id="maximum"),
+    pytest.param("+1000000", [900001], 4000, id="leading-plus"),
+    # Configuration normalizes whitespace before plugin parsing.
+    pytest.param(" 1000000", [900001], 4000, id="leading-space"),
+    pytest.param(1, [450001, 450001], 60000, id="minimum"),
+    pytest.param(2, [450001, 450001], 60000, id="array-envelope"),
+])
+def test_explicit_batch_target_controls_grouping(tmp_path, monkeypatch, compress,
+                                                target, sizes, wait_ms):
+    service = batch_service(tmp_path, count=2, wait_ms=wait_ms)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    expected = {i: exact_size_record(i, 450001) for i in range(2)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    config["pipeline"]["outputs"][0].update(
+        {"time_generated": True, "compress": compress, "batch_target_size": target})
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        gates.wait(service, len(sizes))
+        assert_target_requests(gates, expected, sizes)
+        assert metrics(service)["proc_records"] == 0
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
+                                           timeout=10, description="configured-target chunks delivered")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert_target_requests(gates, expected, sizes)
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+@pytest.mark.parametrize("batched", [False, True], ids=["unbatched", "batched"])
+@pytest.mark.parametrize("target", ["", "800000 "], ids=["empty", "trailing-space"])
+def test_normalized_batch_target_preserves_delivery(tmp_path, monkeypatch, compress, batched, target):
+    service = batch_service(tmp_path, count=3, wait_ms=2000)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    expected = {i: exact_size_record(i, 300001) for i in range(3)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    output = config["pipeline"]["outputs"][0]
+    # Empty strings become omitted values; trailing whitespace is trimmed.
+    # Both therefore use 800000, without enabling batching on their own.
+    output.update({"time_generated": True, "compress": compress, "batch_target_size": target})
+    if not batched:
+        del output["batch_wait_ms"]
+    path.write_text(yaml.safe_dump(config))
+    sizes = [600001, 300001] if batched else [300001, 300001, 300001]
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        gates.wait(service, 1)
+        assert metrics(service)["proc_records"] == 0
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 3,
+                                           timeout=15, description="normalized-target chunks delivered")
+        # All three arrays would combine to 900001 at the old 1000000 ceiling.
+        assert_target_requests(gates, expected, sizes)
+        assert metrics(service)["retries"] == 0
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert_target_requests(gates, expected, sizes)
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+@pytest.mark.parametrize("target", [None, 600000], ids=["default", "smaller"])
+def test_exact_batch_target_closes_without_collection_expiry(tmp_path, monkeypatch, compress, target):
+    service = batch_service(tmp_path, count=2, wait_ms=60000)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    target_bytes = 800000 if target is None else target
+    expected = {i: exact_size_record(i, target_bytes // 2 + (i == 0)) for i in range(2)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    output = config["pipeline"]["outputs"][0]
+    output.update({"time_generated": True, "compress": compress})
+    if target is not None:
+        output["batch_target_size"] = target
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        # The receiver's 20-second wait cannot be satisfied by the 60-second timer.
+        gates.wait(service, 1)
+        assert_target_requests(gates, expected, [target_bytes])
+        assert metrics(service)["proc_records"] == 0
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
+                                           timeout=10, description="exact-target chunks delivered")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert_target_requests(gates, expected, [target_bytes])
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+def test_target_exceeding_singleton_isolated_between_smaller_chunks(tmp_path, monkeypatch, compress):
+    service = batch_service(tmp_path, count=0, wait_ms=4000)
+    port = service.service.allocate_port_env("TEST_TARGET_INPUT_PORT")
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"]["flush"] = 0.05
+    config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
+    config["pipeline"]["outputs"][0].update({"time_generated": True, "compress": compress})
+    path.write_text(yaml.safe_dump(config))
+    sizes = [100001, 900001, 100001]
+    expected = {i: exact_size_record(i, size) for i, size in enumerate(sizes)}
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        for chunk_id, record in expected.items():
+            response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
+                                     json=record, timeout=5)
+            response.raise_for_status()
+            service.service.wait_for_condition(
+                lambda: len(re.findall(r"\[task\] created task=.* OK",
+                                       Path(service.flb.log_file).read_text())) == chunk_id + 1,
+                timeout=10, interval=0.02, description=f"separate target-test chunk {chunk_id}")
+        gates.wait(service, 3)
+        assert_target_requests(gates, expected, sizes)
+        assert all(len(item["records"]) == 1 for item in gates.requests)
+        assert metrics(service)["proc_records"] == 0
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 3,
+                                           timeout=10, description="singleton and smaller peers delivered")
+        assert metrics(service)["retries"] == 0
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert_target_requests(gates, expected, sizes)
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+@pytest.mark.parametrize("workers", [0, 1])
+def test_target_without_wait_remains_unbatched(tmp_path, monkeypatch, compress, workers):
+    service = batch_service(tmp_path, count=2)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    expected = {i: exact_size_record(i, 1001) for i in range(2)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    output = config["pipeline"]["outputs"][0]
+    del output["batch_wait_ms"]
+    output.update({"time_generated": True, "compress": compress,
+                   "batch_target_size": 600000, "workers": workers})
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch, max_bytes=1000000)
+    try:
+        service.start()
+        gates.wait(service, 1)
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
+                                           timeout=15, description="unbatched target-only chunks delivered")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert_target_requests(gates, expected, [1001, 1001])
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
 def test_whole_chunks_respect_service_byte_ceiling(tmp_path, monkeypatch, compress):
     service = batch_service(tmp_path, count=3, wait_ms=2000)
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
         source.update({"dummy": json.dumps(sized_record(chunk_id)), "copies": 1})
-    config["pipeline"]["outputs"][0].update({"compress": compress, "retry_limit": 1})
+    config["pipeline"]["outputs"][0].update(
+        {"compress": compress, "retry_limit": 1, "batch_target_size": 1000000})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
@@ -290,7 +515,7 @@ def test_byte_closed_sender_does_not_acknowledge_next_collecting_chunk(tmp_path,
     config = yaml.safe_load(path.read_text())
     config["service"]["flush"] = 0.05
     config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
-    config["pipeline"]["outputs"][0]["compress"] = compress
+    config["pipeline"]["outputs"][0].update({"compress": compress, "batch_target_size": 1000000})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
@@ -334,7 +559,8 @@ def test_exact_service_limit_closes_without_collection_expiry(tmp_path, monkeypa
     config = yaml.safe_load(path.read_text())
     for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
         source.update({"dummy": json.dumps(exact_size_record(chunk_id, 333334)), "copies": 1})
-    config["pipeline"]["outputs"][0].update({"time_generated": True, "compress": compress})
+    config["pipeline"]["outputs"][0].update(
+        {"time_generated": True, "compress": compress, "batch_target_size": 1000000})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
@@ -418,6 +644,10 @@ def test_three_chunks_wait_for_shared_response(tmp_path, monkeypatch):
 
 def test_closed_batches_complete_independently(tmp_path, monkeypatch):
     service = batch_service(tmp_path, count=6, wait_ms=2000, chunk_bytes=330000)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["pipeline"]["outputs"][0]["batch_target_size"] = 1000000
+    path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch)
     try:
         service.start()
@@ -525,6 +755,13 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     {"batch_wait_ms": 1000, "workers": 1},
     {"batch_wait_ms": 1000, "workers": 2},
     {"batch_wait_ms": 1000, "http_timeout": 5},
+] + [
+    pytest.param({"batch_target_size": target, **wait_options},
+                 id=f"target-{label}-{mode}")
+    for target, label in [(" ", "blank"), (0, "zero"), (-1, "negative"),
+                          (1000001, "above-ceiling"), ("999999999999999999999", "overflow"),
+                          ("800000junk", "junk"), ("800K", "suffix"), ("800000.5", "fraction")]
+    for wait_options, mode in [({}, "unbatched"), ({"batch_wait_ms": 1000}, "batched")]
 ])
 def test_batch_configuration_rejected_before_suspension(tmp_path, options):
     import subprocess
@@ -554,6 +791,11 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         assert "unknown configuration property 'http_timeout'" in report
     elif "batch_chunk_count" in options:
         assert "unknown configuration property 'batch_chunk_count'" in report
+    elif options.get("batch_target_size") == " ":
+        # Space-only values fail in YAML parsing, before plugin initialization.
+        assert "unable to add variant value property" in report
+    elif "batch_target_size" in options:
+        assert "batch_target_size must be an integer from 1 to 1000000 bytes" in report
     else:
         assert "batching requires positive batch_wait_ms and workers=0" in report
     if leaks_enabled():
@@ -561,7 +803,8 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         assert result.returncode == 0, report
         assert "0 leaks for 0 total leaked bytes" in report, report
     else:
-        assert result.returncode == 255, report
+        expected_exit = 1 if options.get("batch_target_size") == " " else 255
+        assert result.returncode == expected_exit, report
         if valgrind_enabled():
             assert "ERROR SUMMARY: 0 errors" in report, report
 
@@ -604,7 +847,7 @@ def test_batch_timer_rearms_and_releases_after_delivery(tmp_path, monkeypatch):
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"]["flush"] = 0.1
-    config["pipeline"]["outputs"][0]["time_generated"] = True
+    config["pipeline"]["outputs"][0].update({"time_generated": True, "batch_target_size": 1000000})
     config["pipeline"]["inputs"] = [
         {"name": "http", "listen": "127.0.0.1", "port": port}]
     path.write_text(yaml.safe_dump(config))
