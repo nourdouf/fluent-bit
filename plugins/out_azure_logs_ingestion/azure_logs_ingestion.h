@@ -35,6 +35,8 @@
 #define FLB_AZ_LI_TOKEN_TIMEOUT 3600
 /* Conservative service ceiling for both JSON and the selected HTTP body. */
 #define FLB_AZ_LI_MAX_BODY_BYTES 1000000
+/* Default collection target; the service ceiling remains fixed. */
+#define FLB_AZ_LI_DEFAULT_BATCH_TARGET_SIZE 800000
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_output.h>
@@ -49,6 +51,7 @@
 struct flb_az_li {
     /* Opt-in, whole callback chunks; used only on the main scheduler. */
     int batch_wait_ms;
+    int batch_target_size;
     struct az_li_batch *collecting;
     struct mk_list parked;
     struct flb_sched_timer *batch_timer;

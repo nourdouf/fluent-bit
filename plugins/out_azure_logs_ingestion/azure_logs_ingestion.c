@@ -85,6 +85,16 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
             return -1;
         }
     }
+    ctx->batch_target_size = FLB_AZ_LI_DEFAULT_BATCH_TARGET_SIZE;
+    if (flb_output_get_property("batch_target_size", ins)) {
+        if (az_li_positive_option(flb_output_get_property("batch_target_size", ins),
+                                  &ctx->batch_target_size) != 0 ||
+            ctx->batch_target_size > FLB_AZ_LI_MAX_BODY_BYTES) {
+            flb_plg_error(ins, "batch_target_size must be an integer from 1 to 1000000 bytes");
+            flb_az_li_ctx_destroy(ctx);
+            return -1;
+        }
+    }
     /* Only the main scheduler uses the coroutine refresh gate. Legacy worker
      * instances retain synchronous OAuth and mutex-protected token access. */
     if (ins->tp_workers == 0) {
@@ -710,10 +720,11 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     }
 
     batch = ctx->collecting;
-    /* Collecting arrays are strictly below the ceiling. Empty arrays add no comma.
-     * An oversized singleton must also displace a batch containing only []. */
-    if (!batch || size > FLB_AZ_LI_MAX_BODY_BYTES ||
-        (size > 2 && size - 2 > FLB_AZ_LI_MAX_BODY_BYTES - batch->json_size -
+    /* Collecting arrays are strictly below the target. Empty arrays add no comma.
+     * Immediate closure after admission also preserves this invariant for targets < 3.
+     * A target-exceeding singleton must displace a batch containing only []. */
+    if (!batch || size > ctx->batch_target_size ||
+        (size > 2 && size - 2 > ctx->batch_target_size - batch->json_size -
                                (batch->json_size > 2))) {
         replacement = flb_calloc(1, sizeof(*replacement));
         if (!replacement) {
@@ -750,7 +761,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     if (size > 2) {
         batch->json_size += size - 2 + (batch->json_size > 2);
     }
-    if (batch->json_size >= FLB_AZ_LI_MAX_BODY_BYTES ||
+    if (batch->json_size >= ctx->batch_target_size ||
         az_li_now_ms() >= batch->deadline || config->is_shutting_down) {
         az_li_batch_close(ctx);
     }
@@ -835,6 +846,13 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_STR, "batch_wait_ms", NULL,
      0, FLB_FALSE, 0,
      "Positive collection wait in milliseconds from the first chunk; requires workers=0."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "batch_target_size", "800000",
+     0, FLB_FALSE, 0,
+     "Collection target in uncompressed JSON bytes, from 1 to 1000000 without size suffixes. "
+     "Close before admitting a chunk that would exceed the target; larger single chunks go alone. "
+     "Does not enable batching without batch_wait_ms."
     },
     {
      FLB_CONFIG_MAP_TIME, "http.response_timeout", "5s",
