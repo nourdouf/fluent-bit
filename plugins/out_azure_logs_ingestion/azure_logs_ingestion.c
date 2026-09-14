@@ -902,7 +902,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
 
     if (member.send) {
         result = az_li_batch_prepare(ctx, batch, &body);
-        batch->result = result == 0 ? az_li_send(ctx, &body, batch->count) : FLB_ERROR;
+        batch->result = result == 0 ? az_li_send(ctx, &body, batch->count) : FLB_RETRY;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
         mk_list_foreach(head, &batch->members) {
             peer = mk_list_entry(head, struct az_li_member, member_link);
