@@ -54,7 +54,11 @@ struct flb_az_li {
     int batch_target_size;
     struct az_li_batch *collecting;
     struct mk_list parked;
+    struct mk_list batch_ready;
     struct flb_sched_timer *batch_timer;
+    struct mk_event batch_event;
+    int batch_channel[2];
+    int batch_notification_pending;
 
     int response_timeout;
     /* Coroutine single-flight token refresh, only for workers=0. */

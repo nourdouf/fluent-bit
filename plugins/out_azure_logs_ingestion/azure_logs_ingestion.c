@@ -32,6 +32,7 @@
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 #include <fluent-bit/flb_scheduler.h>
+#include <fluent-bit/flb_engine_macros.h>
 #include <fluent-bit/flb_coro.h>
 #include <fluent-bit/flb_upstream_conn.h>
 #include <time.h>
@@ -41,7 +42,10 @@
 #include "azure_logs_ingestion.h"
 #include "azure_logs_ingestion_conf.h"
 
+#define AZ_LI_BATCH_DISPATCH_LIMIT 64
+
 static void az_li_batch_tick(struct flb_config *config, void *data);
+static int az_li_batch_dispatch(void *data);
 
 static int az_li_positive_option(const char *value, int *result)
 {
@@ -76,7 +80,10 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     }
 
     mk_list_init(&ctx->parked);
+    mk_list_init(&ctx->batch_ready);
     mk_list_init(&ctx->auth_waiters);
+    ctx->batch_channel[0] = -1;
+    ctx->batch_channel[1] = -1;
     if (flb_output_get_property("batch_wait_ms", ins)) {
         if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
                                   &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
@@ -94,6 +101,18 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
+    }
+    if (ctx->batch_wait_ms > 0) {
+        MK_EVENT_INIT(&ctx->batch_event, -1, ctx, az_li_batch_dispatch);
+        if (mk_event_channel_create(config->evl, &ctx->batch_channel[0],
+                                     &ctx->batch_channel[1], &ctx->batch_event) != 0) {
+            flb_plg_error(ins, "cannot create batch completion channel");
+            flb_az_li_ctx_destroy(ctx);
+            return -1;
+        }
+        ctx->batch_event.type = FLB_ENGINE_EV_CUSTOM;
+        /* Completion notifications must drain before another group can publish. */
+        ctx->batch_event.priority = FLB_ENGINE_PRIORITY_BOTTOM;
     }
     /* Only the main scheduler uses the coroutine refresh gate. Legacy worker
      * instances retain synchronous OAuth and mutex-protected token access. */
@@ -580,7 +599,7 @@ cleanup:
 }
 
 /* Membership borrows postprocessor chunks until every request outcome is published.
- * Only the timer resumes plugin-parked callbacks, never a sender in network I/O. */
+ * Only the dispatcher resumes plugin-parked callbacks, never a sender in network I/O. */
 struct az_li_batch {
     struct mk_list members;
     int count;
@@ -588,7 +607,6 @@ struct az_li_batch {
     size_t emitted_size;
     struct flb_gzip_stream *gzip;
     int references;
-    int done;
     int result;
     uint64_t deadline;
 };
@@ -603,6 +621,22 @@ struct az_li_member {
     int send;
 };
 
+static void az_li_batch_notify(struct flb_az_li *ctx)
+{
+    unsigned char notification = 1;
+
+    if (ctx->batch_notification_pending || mk_list_is_empty(&ctx->batch_ready) == 0) {
+        return;
+    }
+    /* Main-thread ownership permits only one unread wake-up, not one per member. */
+    if (flb_pipe_w(ctx->batch_channel[1], &notification, sizeof(notification)) !=
+        sizeof(notification)) {
+        flb_plg_error(ctx->ins, "cannot notify batch completion dispatcher");
+        return;
+    }
+    ctx->batch_notification_pending = FLB_TRUE;
+}
+
 static void az_li_batch_close(struct flb_az_li *ctx)
 {
     struct az_li_member *sender;
@@ -611,42 +645,53 @@ static void az_li_batch_close(struct flb_az_li *ctx)
     sender = mk_list_entry_first(&ctx->collecting->members, struct az_li_member, member_link);
     ctx->collecting = NULL;
     sender->send = FLB_TRUE;
+    if (!mk_list_entry_is_orphan(&sender->parked_link)) {
+        mk_list_del(&sender->parked_link);
+        mk_list_add(&sender->parked_link, &ctx->batch_ready);
+        az_li_batch_notify(ctx);
+    }
 }
 
 static void az_li_batch_tick(struct flb_config *config, void *data)
 {
     struct flb_az_li *ctx = data;
-    struct az_li_member *member;
-    struct mk_list *head;
-    struct mk_list *tmp;
-    struct mk_list ready;
-    struct flb_coro *coro;
 
     if (ctx->collecting && (az_li_now_ms() >= ctx->collecting->deadline ||
                            config->is_shutting_down)) {
         az_li_batch_close(ctx);
     }
-
-    /* Detach ready entries before resuming. Each callback owns its membership
-     * reference, so resuming one cannot free another entry in this local list. */
-    mk_list_init(&ready);
-    mk_list_foreach_safe(head, tmp, &ctx->parked) {
-        member = mk_list_entry(head, struct az_li_member, parked_link);
-        if (member->send || member->batch->done) {
-            mk_list_del(&member->parked_link);
-            mk_list_add(&member->parked_link, &ready);
-        }
+    /* Also retry a wake-up interrupted before its byte reached the channel. */
+    az_li_batch_notify(ctx);
+    if (mk_list_is_empty(&ctx->parked) == 0 && mk_list_is_empty(&ctx->batch_ready) == 0) {
+        flb_sched_timer_cb_destroy(ctx->batch_timer);
+        ctx->batch_timer = NULL;
     }
-    while (mk_list_is_empty(&ready) != 0) {
-        member = mk_list_entry_first(&ready, struct az_li_member, parked_link);
+}
+
+static int az_li_batch_dispatch(void *data)
+{
+    struct mk_event *event = data;
+    struct flb_az_li *ctx = event->data;
+    struct az_li_member *member;
+    struct flb_coro *coro;
+    unsigned char notification;
+    int count;
+
+    if (flb_pipe_r(ctx->batch_channel[0], &notification, sizeof(notification)) !=
+        sizeof(notification)) {
+        flb_plg_error(ctx->ins, "cannot read batch completion notification");
+        return -1;
+    }
+    ctx->batch_notification_pending = FLB_FALSE;
+    for (count = 0; count < AZ_LI_BATCH_DISPATCH_LIMIT &&
+                    mk_list_is_empty(&ctx->batch_ready) != 0; count++) {
+        member = mk_list_entry_first(&ctx->batch_ready, struct az_li_member, parked_link);
         coro = member->coro;
         mk_list_del(&member->parked_link);
         flb_coro_resume(coro);
     }
-    if (mk_list_is_empty(&ctx->parked) == 0) {
-        flb_sched_timer_cb_destroy(ctx->batch_timer);
-        ctx->batch_timer = NULL;
-    }
+    az_li_batch_notify(ctx);
+    return 0;
 }
 
 static void az_li_batch_plain(struct flb_az_li *ctx, struct az_li_batch *batch)
@@ -775,6 +820,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     struct az_li_batch *batch;
     struct az_li_batch *replacement = NULL;
     struct az_li_member member = {0};
+    struct az_li_member *peer;
+    struct mk_list *head;
     flb_sds_t payload = NULL;
     struct az_li_body body = {0};
     size_t size;
@@ -859,7 +906,14 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         result = az_li_batch_prepare(ctx, batch, &body);
         batch->result = result == 0 ? az_li_send(ctx, &body, batch->count) : FLB_ERROR;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
-        batch->done = FLB_TRUE;
+        mk_list_foreach(head, &batch->members) {
+            peer = mk_list_entry(head, struct az_li_member, member_link);
+            if (peer != &member) {
+                mk_list_del(&peer->parked_link);
+                mk_list_add(&peer->parked_link, &ctx->batch_ready);
+            }
+        }
+        az_li_batch_notify(ctx);
     }
     result = batch->result;
     mk_list_del(&member.member_link);
@@ -879,6 +933,10 @@ static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
 
     if (ctx->batch_timer) {
         flb_sched_timer_cb_destroy(ctx->batch_timer);
+    }
+    if (ctx->batch_channel[0] != -1) {
+        mk_event_channel_destroy(config->evl, ctx->batch_channel[0],
+                                ctx->batch_channel[1], &ctx->batch_event);
     }
     if (ctx->auth_wake_timer) {
         flb_sched_timer_cb_destroy(ctx->auth_wake_timer);
