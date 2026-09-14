@@ -60,7 +60,6 @@ struct flb_az_li {
     int batch_channel[2];
     int batch_notification_pending;
 
-    int response_timeout;
     /* Coroutine single-flight token refresh, only for workers=0. */
     int auth_refreshing;
     struct mk_list auth_waiters;

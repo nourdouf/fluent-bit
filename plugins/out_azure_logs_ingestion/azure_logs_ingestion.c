@@ -421,7 +421,6 @@ static char *az_li_token_request(struct flb_az_li *ctx)
     if (!client) {
         goto cleanup;
     }
-    flb_http_set_response_timeout(client, ctx->response_timeout);
     ret = flb_http_add_header(client, FLB_HTTP_HEADER_CONTENT_TYPE,
                               sizeof(FLB_HTTP_HEADER_CONTENT_TYPE) - 1,
                               FLB_OAUTH2_HTTP_ENCODING, sizeof(FLB_OAUTH2_HTTP_ENCODING) - 1);
@@ -519,8 +518,6 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
         flush_status = FLB_RETRY;
         goto cleanup;
     }
-
-    flb_http_set_response_timeout(c, ctx->response_timeout);
 
     /* Append headers */
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
@@ -998,11 +995,6 @@ static struct flb_config_map config_map[] = {
      "Close after whole-chunk admission when emitted gzip bytes, or plain JSON bytes, reach the target. "
      "The independent 1000000-byte raw ceiling may close a batch before the target. "
      "Does not enable batching without batch_wait_ms."
-    },
-    {
-     FLB_CONFIG_MAP_TIME, "http.response_timeout", "5s",
-     0, FLB_TRUE, offsetof(struct flb_az_li, response_timeout),
-     "HTTP response timeout applied independently to OAuth and ingestion requests."
     },
     /* optional params */
     {
