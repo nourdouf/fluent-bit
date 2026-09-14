@@ -43,10 +43,11 @@
 #include "azure_logs_ingestion_conf.h"
 #include "azure_logs_ingestion_gzip.h"
 
-#define AZ_LI_BATCH_DISPATCH_LIMIT 64
+#define AZ_LI_DISPATCH_LIMIT 64
 
 static void az_li_batch_tick(struct flb_config *config, void *data);
-static int az_li_batch_dispatch(void *data);
+static int az_li_dispatch(void *data);
+static void az_li_notify(struct flb_az_li *ctx);
 
 static int az_li_positive_option(const char *value, int *result)
 {
@@ -83,8 +84,8 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     mk_list_init(&ctx->parked);
     mk_list_init(&ctx->batch_ready);
     mk_list_init(&ctx->auth_waiters);
-    ctx->batch_channel[0] = -1;
-    ctx->batch_channel[1] = -1;
+    ctx->continuation_channel[0] = -1;
+    ctx->continuation_channel[1] = -1;
     if (flb_output_get_property("batch_wait_ms", ins)) {
         if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
                                   &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
@@ -103,21 +104,20 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
             return -1;
         }
     }
-    if (ctx->batch_wait_ms > 0) {
-        MK_EVENT_INIT(&ctx->batch_event, -1, ctx, az_li_batch_dispatch);
-        if (mk_event_channel_create(config->evl, &ctx->batch_channel[0],
-                                     &ctx->batch_channel[1], &ctx->batch_event) != 0) {
-            flb_plg_error(ins, "cannot create batch completion channel");
+    /* Both batched and unbatched main-thread flushes can wait behind OAuth.
+     * Legacy workers retain synchronous OAuth and mutex-protected token access. */
+    if (ins->tp_workers == 0) {
+        MK_EVENT_INIT(&ctx->continuation_event, -1, ctx, az_li_dispatch);
+        if (mk_event_channel_create(config->evl, &ctx->continuation_channel[0],
+                                     &ctx->continuation_channel[1],
+                                     &ctx->continuation_event) != 0) {
+            flb_plg_error(ins, "cannot create continuation channel");
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
-        ctx->batch_event.type = FLB_ENGINE_EV_CUSTOM;
+        ctx->continuation_event.type = FLB_ENGINE_EV_CUSTOM;
         /* Completion notifications must drain before another group can publish. */
-        ctx->batch_event.priority = FLB_ENGINE_PRIORITY_BOTTOM;
-    }
-    /* Only the main scheduler uses the coroutine refresh gate. Legacy worker
-     * instances retain synchronous OAuth and mutex-protected token access. */
-    if (ins->tp_workers == 0) {
+        ctx->continuation_event.priority = FLB_ENGINE_PRIORITY_BOTTOM;
         flb_stream_enable_async_mode(&ctx->u_auth->u->base);
     }
     return 0;
@@ -240,41 +240,16 @@ struct az_li_auth_waiter {
     struct mk_list link;
 };
 
-static void az_li_auth_wake(struct flb_config *config, void *data)
-{
-    struct flb_az_li *ctx = data;
-    struct az_li_auth_waiter *waiter;
-    struct flb_coro *coro;
-
-    if (!ctx->auth_refreshing && mk_list_is_empty(&ctx->auth_waiters) != 0) {
-        waiter = mk_list_entry_first(&ctx->auth_waiters, struct az_li_auth_waiter, link);
-        coro = waiter->coro;
-        mk_list_del(&waiter->link);
-        flb_coro_resume(coro);
-    }
-    if (mk_list_is_empty(&ctx->auth_waiters) == 0) {
-        flb_sched_timer_cb_destroy(ctx->auth_wake_timer);
-        ctx->auth_wake_timer = NULL;
-    }
-}
-
-static int az_li_auth_acquire(struct flb_az_li *ctx)
+static void az_li_auth_acquire(struct flb_az_li *ctx)
 {
     struct az_li_auth_waiter waiter;
 
     waiter.coro = flb_coro_get();
     while (ctx->auth_refreshing) {
-        if (!ctx->auth_wake_timer &&
-            flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
-                                      10, az_li_auth_wake, ctx,
-                                      &ctx->auth_wake_timer) != 0) {
-            return -1;
-        }
         mk_list_add(&waiter.link, &ctx->auth_waiters);
         flb_coro_yield(waiter.coro, FLB_FALSE);
     }
     ctx->auth_refreshing = FLB_TRUE;
-    return 0;
 }
 
 static char *az_li_token_request(struct flb_az_li *ctx);
@@ -293,9 +268,7 @@ static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
         /* A cached-token copy cannot yield on the main scheduler. Refresh and
          * payload mutation can, so wait before touching a refreshing cache. */
         if (ctx->auth_refreshing || flb_oauth2_token_expired(ctx->u_auth) == FLB_TRUE) {
-            if (az_li_auth_acquire(ctx) != 0) {
-                return NULL;
-            }
+            az_li_auth_acquire(ctx);
             owns_refresh = FLB_TRUE;
         }
     }
@@ -364,6 +337,8 @@ static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
 token_cleanup:
     if (owns_refresh) {
         ctx->auth_refreshing = FLB_FALSE;
+        /* Success releases cache readers; failure lets the next waiter refresh. */
+        az_li_notify(ctx);
     }
     if (!async && pthread_mutex_unlock(&ctx->token_mutex)) {
         flb_plg_error(ctx->ins, "error unlocking mutex");
@@ -619,20 +594,34 @@ struct az_li_member {
     int send;
 };
 
-static void az_li_batch_notify(struct flb_az_li *ctx)
+static int az_li_notification_interrupted(void)
+{
+#ifdef FLB_SYSTEM_WINDOWS
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
+static void az_li_notify(struct flb_az_li *ctx)
 {
     unsigned char notification = 1;
+    ssize_t ret;
 
-    if (ctx->batch_notification_pending || mk_list_is_empty(&ctx->batch_ready) == 0) {
+    if (ctx->notification_pending ||
+        (mk_list_is_empty(&ctx->batch_ready) == 0 &&
+         (ctx->auth_refreshing || mk_list_is_empty(&ctx->auth_waiters) == 0))) {
         return;
     }
     /* Main-thread ownership permits only one unread wake-up, not one per member. */
-    if (flb_pipe_w(ctx->batch_channel[1], &notification, sizeof(notification)) !=
-        sizeof(notification)) {
-        flb_plg_error(ctx->ins, "cannot notify batch completion dispatcher");
+    do {
+        ret = flb_pipe_w(ctx->continuation_channel[1], &notification, sizeof(notification));
+    } while (ret == -1 && az_li_notification_interrupted());
+    if (ret != sizeof(notification)) {
+        flb_plg_error(ctx->ins, "cannot notify continuation dispatcher");
         return;
     }
-    ctx->batch_notification_pending = FLB_TRUE;
+    ctx->notification_pending = FLB_TRUE;
 }
 
 static void az_li_batch_close(struct flb_az_li *ctx)
@@ -646,7 +635,7 @@ static void az_li_batch_close(struct flb_az_li *ctx)
     if (!mk_list_entry_is_orphan(&sender->parked_link)) {
         mk_list_del(&sender->parked_link);
         mk_list_add(&sender->parked_link, &ctx->batch_ready);
-        az_li_batch_notify(ctx);
+        az_li_notify(ctx);
     }
 }
 
@@ -658,37 +647,60 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
                            config->is_shutting_down)) {
         az_li_batch_close(ctx);
     }
-    /* Also retry a wake-up interrupted before its byte reached the channel. */
-    az_li_batch_notify(ctx);
+    az_li_notify(ctx);
     if (mk_list_is_empty(&ctx->parked) == 0 && mk_list_is_empty(&ctx->batch_ready) == 0) {
         flb_sched_timer_cb_destroy(ctx->batch_timer);
         ctx->batch_timer = NULL;
     }
 }
 
-static int az_li_batch_dispatch(void *data)
+static int az_li_dispatch(void *data)
 {
     struct mk_event *event = data;
     struct flb_az_li *ctx = event->data;
     struct az_li_member *member;
+    struct az_li_auth_waiter *waiter;
     struct flb_coro *coro;
     unsigned char notification;
+    ssize_t ret;
     int count;
+    int batch_ready;
+    int auth_ready;
 
-    if (flb_pipe_r(ctx->batch_channel[0], &notification, sizeof(notification)) !=
-        sizeof(notification)) {
-        flb_plg_error(ctx->ins, "cannot read batch completion notification");
+    do {
+        ret = flb_pipe_r(ctx->continuation_channel[0], &notification, sizeof(notification));
+    } while (ret == -1 && az_li_notification_interrupted());
+    if (ret != sizeof(notification)) {
+        flb_plg_error(ctx->ins, "cannot read continuation notification");
         return -1;
     }
-    ctx->batch_notification_pending = FLB_FALSE;
-    for (count = 0; count < AZ_LI_BATCH_DISPATCH_LIMIT &&
-                    mk_list_is_empty(&ctx->batch_ready) != 0; count++) {
-        member = mk_list_entry_first(&ctx->batch_ready, struct az_li_member, parked_link);
-        coro = member->coro;
-        mk_list_del(&member->parked_link);
+    ctx->notification_pending = FLB_FALSE;
+    for (count = 0; count < AZ_LI_DISPATCH_LIMIT; count++) {
+        batch_ready = mk_list_is_empty(&ctx->batch_ready) != 0;
+        auth_ready = !ctx->auth_refreshing && mk_list_is_empty(&ctx->auth_waiters) != 0;
+        if (!batch_ready && !auth_ready) {
+            break;
+        }
+        /* Alternate eligible classes so neither a completion backlog nor token
+         * waiters can starve the other. Both share the completion-pipe budget. */
+        if (auth_ready && (!batch_ready || ctx->prefer_auth)) {
+            waiter = mk_list_entry_first(&ctx->auth_waiters, struct az_li_auth_waiter, link);
+            coro = waiter->coro;
+            mk_list_del(&waiter->link);
+            ctx->prefer_auth = FLB_FALSE;
+        }
+        else {
+            member = mk_list_entry_first(&ctx->batch_ready, struct az_li_member, parked_link);
+            coro = member->coro;
+            mk_list_del(&member->parked_link);
+            ctx->prefer_auth = FLB_TRUE;
+        }
+        /* Unlink before resuming: it may return or enter network IO. Recheck
+         * refresh ownership each turn, especially after a failed refresh elects
+         * a successor. Only the engine may resume that successor's network IO. */
         flb_coro_resume(coro);
     }
-    az_li_batch_notify(ctx);
+    az_li_notify(ctx);
     return 0;
 }
 
@@ -911,7 +923,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
                 mk_list_add(&peer->parked_link, &ctx->batch_ready);
             }
         }
-        az_li_batch_notify(ctx);
+        az_li_notify(ctx);
     }
     result = batch->result;
     mk_list_del(&member.member_link);
@@ -932,12 +944,11 @@ static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
     if (ctx->batch_timer) {
         flb_sched_timer_cb_destroy(ctx->batch_timer);
     }
-    if (ctx->batch_channel[0] != -1) {
-        mk_event_channel_destroy(config->evl, ctx->batch_channel[0],
-                                ctx->batch_channel[1], &ctx->batch_event);
-    }
-    if (ctx->auth_wake_timer) {
-        flb_sched_timer_cb_destroy(ctx->auth_wake_timer);
+    /* Stop notification delivery without touching stack-owned waiter links:
+     * forced teardown may already have destroyed their engine coroutines. */
+    if (ctx->continuation_channel[0] != -1) {
+        mk_event_channel_destroy(config->evl, ctx->continuation_channel[0],
+                                ctx->continuation_channel[1], &ctx->continuation_event);
     }
     flb_plg_debug(ctx->ins, "exiting logs ingestion plugin");
     flb_az_li_ctx_destroy(ctx);

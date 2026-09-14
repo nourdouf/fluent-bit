@@ -56,14 +56,16 @@ struct flb_az_li {
     struct mk_list parked;
     struct mk_list batch_ready;
     struct flb_sched_timer *batch_timer;
-    struct mk_event batch_event;
-    int batch_channel[2];
-    int batch_notification_pending;
+
+    /* Shared bounded continuation for batch and auth waiters, only workers=0. */
+    struct mk_event continuation_event;
+    int continuation_channel[2];
+    int notification_pending;
+    int prefer_auth;
 
     /* Coroutine single-flight token refresh, only for workers=0. */
     int auth_refreshing;
     struct mk_list auth_waiters;
-    struct flb_sched_timer *auth_wake_timer;
 
     /* log ingestion account setup */
     flb_sds_t tenant_id;
