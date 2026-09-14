@@ -1,4 +1,4 @@
-"""Local real-network coverage for native, independent HTTP request timeouts."""
+"""Local real-network coverage for native connect and IO idle timeout semantics."""
 import json
 import logging
 import socket
@@ -18,7 +18,7 @@ from test_out_azure_logs_ingestion_batch import (
 )
 
 
-def timeout_service(tmp_path, response_timeout="5s"):
+def timeout_service(tmp_path):
     service = batch_service(tmp_path, count=0, wait_ms=10)
     port = service.service.allocate_port_env("TEST_TIMEOUT_INPUT_PORT")
     path = Path(service.service.config_path)
@@ -28,11 +28,6 @@ def timeout_service(tmp_path, response_timeout="5s"):
         {"name": "http", "listen": "127.0.0.1", "port": port}]
     config["pipeline"]["outputs"][0].update(
         {"retry_limit": "no_retries"})
-    # batch_service uses generous gated-peer timeouts; these tests must exercise
-    # the native default when no explicit response timeout is requested.
-    config["pipeline"]["outputs"][0].pop("http.response_timeout", None)
-    if response_timeout is not None:
-        config["pipeline"]["outputs"][0]["http.response_timeout"] = response_timeout
     path.write_text(yaml.safe_dump(config))
     return service, port
 
@@ -54,7 +49,7 @@ def dropped_callbacks(service, count):
     return Path(service.flb.log_file).read_text().count("is not retried (no retry config)") >= count
 
 
-def test_oauth_and_ingestion_have_independent_response_timeouts(tmp_path, monkeypatch):
+def test_oauth_and_ingestion_preserve_credentials_and_token_cache(tmp_path, monkeypatch):
     service, port = timeout_service(tmp_path)
     oauth_started = []
     original = http_server.app.view_functions["oauth_token"]
@@ -73,7 +68,7 @@ def test_oauth_and_ingestion_have_independent_response_timeouts(tmp_path, monkey
         wait(service, lambda: metrics(service)["proc_records"] == 1,
              "both individually valid requests complete", timeout=9)
         elapsed = time.monotonic() - oauth_started[0]
-        assert elapsed >= 6  # The sum exceeds the 5s per-request setting.
+        assert elapsed >= 6  # No plugin-imposed deadline spans the two exchanges.
         assert not dropped_callbacks(service, 1)
         http_server.configure_http_response(delay_seconds=0)
         submit(port, 1)
@@ -92,9 +87,9 @@ def test_oauth_and_ingestion_have_independent_response_timeouts(tmp_path, monkey
         stop_checked(service)
 
 
-def test_response_timeout_with_connection_timeout_disabled(tmp_path, monkeypatch):
-    service, port = timeout_service(tmp_path, response_timeout="2s")
-    set_output(service, **{"net.connect_timeout": 0})
+def test_io_timeout_with_connection_timeout_disabled(tmp_path, monkeypatch):
+    service, port = timeout_service(tmp_path)
+    set_output(service, **{"net.connect_timeout": "0s", "net.io_timeout": "2s"})
     started = []
     original = http_server.app.view_functions["oauth_token"]
 
@@ -109,7 +104,7 @@ def test_response_timeout_with_connection_timeout_disabled(tmp_path, monkeypatch
         submit(port, 0)
         wait(service, lambda: started, "initial OAuth")
         wait(service, lambda: dropped_callbacks(service, 1),
-             "response timeout independent of disabled connect timeout", timeout=5)
+             "IO idle timeout independent of disabled connect timeout", timeout=5)
         elapsed = time.monotonic() - started[0]
         assert 1 <= elapsed < 5, elapsed
         assert metrics(service)["proc_records"] == 0
@@ -122,7 +117,8 @@ def test_response_timeout_with_connection_timeout_disabled(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("count", [1, 3])
 def test_native_timeout_preserves_busy_connection_count(tmp_path, count):
-    service, port = timeout_service(tmp_path, response_timeout="3s")
+    service, port = timeout_service(tmp_path)
+    set_output(service, **{"net.io_timeout": "3s"})
     gauge = "fluentbit_output_upstream_busy_connections"
     total_gauge = "fluentbit_output_upstream_total_connections"
     labels = {"name": "azure_logs_ingestion.0"}
@@ -185,45 +181,70 @@ def test_token_refresh_is_single_flight_and_keeps_engine_responsive(tmp_path, mo
         stop_checked(service)
 
 
-# Native response timeout starts after upload; response bytes do not reset it.
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
-@pytest.mark.parametrize("mode", ["blocked", "trickle"])
-@pytest.mark.parametrize("response_timeout", [
-    pytest.param(None, id="default-timeout"),
-    pytest.param("5s", id="explicit-timeout"),
-])
-def test_response_progress_does_not_extend_response_timeout(
-        tmp_path, monkeypatch, stage, mode, response_timeout):
-    service, port = timeout_service(tmp_path, response_timeout=response_timeout)
-    started = []
-    original = http_server.app.view_functions["oauth_token"]
-
-    def token_receiver():
-        started.append(time.monotonic())
-        return original()
-
-    monkeypatch.setitem(http_server.app.view_functions, "oauth_token", token_receiver)
+@pytest.mark.parametrize("batching,workers", [(True, 0), (False, 0), (False, 1)])
+@pytest.mark.parametrize("io_timeout", [None, "0s"])
+def test_default_or_disabled_io_timeout_allows_slow_response(
+        tmp_path, stage, batching, workers, io_timeout):
+    service, port = timeout_service(tmp_path)
+    set_execution_mode(service, batching, workers)
+    if io_timeout is not None:
+        set_output(service, **{"net.io_timeout": io_timeout})
     configure = (http_server.configure_oauth_token_response if stage == "oauth"
                  else http_server.configure_http_response)
+
+    def metrics_ready():
+        try:
+            metrics(service)
+        except requests.HTTPError as error:
+            if error.response is not None and error.response.status_code == 404:
+                return False
+            raise
+        return True
+
     try:
         service.start()
-        if mode == "blocked":
-            configure(hang_before_response=True)
-        else:
-            configure(stream_fragments=[" "] * 32, fragment_delay_seconds=0.25)
+        wait(service, metrics_ready, "initial metrics snapshot", timeout=10)
+        configure(delay_seconds=6)
+        started = time.monotonic()
         submit(port, 0)
-        wait(service, lambda: started, "initial OAuth")
-        wait(service, lambda: dropped_callbacks(service, 1),
-             "blocked or trickling response times out", timeout=8)
-        elapsed = time.monotonic() - started[0]
-        logging.getLogger(__name__).info("response stage=%s mode=%s elapsed=%.3fs", stage, mode, elapsed)
-        assert 4 <= elapsed < 8
-        assert metrics(service)["proc_records"] == 0
-        assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
-                              dcr_id="dcr-suite", status="200") == 0
-        configure(hang_before_response=False, stream_fragments=None)
-        submit(port, 1)
-        wait(service, lambda: metrics(service)["proc_records"] == 1, "post-cancel recovery")
+        wait(service, lambda: metrics(service)["proc_records"] == 1,
+             "response later than the removed five-second deadline", timeout=12)
+        assert time.monotonic() - started >= 6
+        assert not dropped_callbacks(service, 1)
+        assert metrics(service)["retries"] == 0
+        assert metrics(service)["dropped_records"] == 0
+    finally:
+        stop_checked(service)
+
+
+@pytest.mark.parametrize("stage", ["oauth", "ingestion"])
+@pytest.mark.parametrize("batching,workers", [(True, 0), (False, 0), (False, 1)])
+def test_response_progress_resets_native_io_idle_timeout(tmp_path, stage, batching, workers):
+    service, port = timeout_service(tmp_path)
+    set_execution_mode(service, batching, workers)
+    set_output(service, **{"net.io_timeout": "2s"})
+    configure = (http_server.configure_oauth_token_response if stage == "oauth"
+                 else http_server.configure_http_response)
+    # The OAuth parser needs a complete valid token, not just whitespace. Each
+    # fragment arrives well within the idle interval; the full body takes >5s.
+    payload = (json.dumps({"access_token": "stream-token", "token_type": "Bearer",
+                           "expires_in": 300}) if stage == "oauth" else "{}")
+    try:
+        service.start()
+        configure(stream_fragments=[" "] * 24 + [payload], fragment_delay_seconds=0.25)
+        started = time.monotonic()
+        submit(port, 0)
+        wait(service, lambda: metrics(service)["proc_records"] == 1,
+             "progressing response completes beyond the idle interval", timeout=12)
+        assert time.monotonic() - started >= 6
+        assert not dropped_callbacks(service, 1)
+        assert metrics(service)["retries"] == 0
+        assert metrics(service)["dropped_records"] == 0
+        if stage == "oauth":
+            ingestion = [r for r in http_server.data_storage["requests"]
+                         if r["path"].startswith("/dataCollectionRules/")]
+            assert ingestion[0]["headers"]["Authorization"] == "Bearer stream-token"
     finally:
         stop_checked(service)
 
@@ -417,7 +438,7 @@ def test_failed_exchange_connection_disposition_and_engine_recovery(tmp_path, st
         service.start()
         submit(port, 0)
         wait(service, lambda: len(receiver.requests) >= 1, "first wire request")
-        # The parser/HTTP failure must return promptly, not wait for the 5s timeout.
+        # The parser/HTTP failure must return promptly, without needing an IO timeout.
         # The second request is the engine retry: no second input record is submitted.
         wait(service, lambda: len(receiver.requests) >= 2,
              "engine retry after completed or malformed response", timeout=3.5)
@@ -516,7 +537,8 @@ def test_stalled_upload_uses_native_io_timeout(tmp_path):
     mode = "blocked"
     service, port = timeout_service(tmp_path)
     receiver = WireReceiver(service, mode)
-    set_output(service, dce_url=f"https://localhost:{receiver.port}", compress=False)
+    set_output(service, **{"dce_url": f"https://localhost:{receiver.port}",
+                           "compress": False, "net.io_timeout": "2s"})
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["pipeline"]["inputs"][0].update({"buffer_max_size": "32M", "buffer_chunk_size": "1M"})
@@ -626,8 +648,10 @@ def test_full_listen_queue_bounds_connect_without_accept(tmp_path, stage):
 
 
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
-def test_native_io_timeout_clamps_response_timeout(tmp_path, stage):
-    service, port = timeout_service(tmp_path, response_timeout="10s")
+@pytest.mark.parametrize("batching,workers", [(True, 0), (False, 0), (False, 1)])
+def test_stalled_response_uses_native_io_idle_timeout(tmp_path, stage, batching, workers):
+    service, port = timeout_service(tmp_path)
+    set_execution_mode(service, batching, workers)
     set_output(service, **{"net.io_timeout": "1s"})
     configure = (http_server.configure_oauth_token_response if stage == "oauth"
                  else http_server.configure_http_response)
@@ -637,7 +661,7 @@ def test_native_io_timeout_clamps_response_timeout(tmp_path, stage):
         started = time.monotonic()
         submit(port, 0)
         wait(service, lambda: dropped_callbacks(service, 1), "native idle timeout", timeout=4)
-        assert time.monotonic() - started < 4  # Not the 10s response setting.
+        assert time.monotonic() - started < 4
         assert metrics(service)["proc_records"] == 0
         assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
                               dcr_id="dcr-suite", status="200") == 0
@@ -648,20 +672,11 @@ def test_native_io_timeout_clamps_response_timeout(tmp_path, stage):
         stop_checked(service)
 
 
-@pytest.mark.parametrize("response_timeout", [None, "2s"])
-@pytest.mark.parametrize("batching", [False, True])
-def test_response_timeout_configuration_with_default(tmp_path, response_timeout, batching):
-    service, port = timeout_service(tmp_path, response_timeout=response_timeout)
+def set_execution_mode(service, batching, workers):
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    output = config["pipeline"]["outputs"][0]
+    output["workers"] = workers
     if not batching:
-        path = Path(service.service.config_path)
-        config = yaml.safe_load(path.read_text())
-        output = config["pipeline"]["outputs"][0]
         del output["batch_wait_ms"]
-        path.write_text(yaml.safe_dump(config))
-    try:
-        service.start()
-        submit(port, 0)
-        wait(service, lambda: metrics(service)["proc_records"] == 1,
-             "default or explicit timeout with or without batching")
-    finally:
-        stop_checked(service)
+    path.write_text(yaml.safe_dump(config))

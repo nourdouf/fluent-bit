@@ -37,8 +37,7 @@ def batch_service(tmp_path, count=3, wait_ms=5000, chunk_bytes=None):
         for i, source in enumerate(config["pipeline"]["inputs"]):
             source["dummy"] = json.dumps(sized_record(i, field_size=chunk_bytes // (10 * (i + 1))))
     config["pipeline"]["outputs"][0].update(
-        {"match": "chunk.*", "workers": 0, "batch_wait_ms": wait_ms,
-         "http.response_timeout": "30s"}
+        {"match": "chunk.*", "workers": 0, "batch_wait_ms": wait_ms}
     )
     config_path = tmp_path / "batch.yaml"
     config_path.write_text(yaml.safe_dump(config))
@@ -928,6 +927,8 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     {"batch_wait_ms": 1000, "workers": 1},
     {"batch_wait_ms": 1000, "workers": 2},
     {"batch_wait_ms": 1000, "http_timeout": 5},
+    {"http.response_timeout": "5s"},
+    {"batch_wait_ms": 1000, "http.response_timeout": "5s"},
 ] + [
     pytest.param({"batch_target_size": target, **wait_options},
                  id=f"target-{label}-{mode}")
@@ -960,7 +961,9 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
     (tmp_path / "startup.log").write_text(report)
     logging.getLogger(__name__).info("startup check options=%s exit=%s report=%s",
                                      options, result.returncode, tmp_path / "startup.log")
-    if "http_timeout" in options:
+    if "http.response_timeout" in options:
+        assert "unknown configuration property 'http.response_timeout'" in report
+    elif "http_timeout" in options:
         assert "unknown configuration property 'http_timeout'" in report
     elif "batch_chunk_count" in options:
         assert "unknown configuration property 'batch_chunk_count'" in report
