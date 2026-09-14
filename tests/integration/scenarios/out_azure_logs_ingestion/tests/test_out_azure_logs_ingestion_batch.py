@@ -9,6 +9,7 @@ import logging
 import datetime
 import re
 import signal
+import socket
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import requests
 import yaml
 
 from server import http_server
+from server.forward_server import _pack_obj
 from test_out_azure_logs_ingestion_001 import Service
 
 
@@ -228,6 +230,88 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     assert "failed to flush chunk" not in log
     assert "cannot be retried" not in log
     assert "is not retried" not in log
+
+
+@pytest.mark.parametrize("compress,status", [(False, 204), (True, 204), (True, 413), (True, 503)])
+def test_large_batch_completion_keeps_engine_responsive(tmp_path, monkeypatch, compress, status):
+    count = 10000
+    service = batch_service(tmp_path, count=0, wait_ms=600000)
+    port = service.service.allocate_port_env("TEST_BATCH_FORWARD_PORT")
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"].update({"flush": 0.05, "grace": 10})
+    config["pipeline"]["inputs"] = [
+        {"name": "forward", "listen": "127.0.0.1", "port": port,
+         "buffer_max_size": "2M", "buffer_chunk_size": "1M"}]
+    config["pipeline"]["outputs"][0].update(
+        {"compress": compress, "time_generated": False,
+         "batch_target_size": 1000000, "retry_limit": "no_retries"})
+    config["pipeline"]["outputs"].append({"name": "null", "match": "barrier", "workers": 0})
+    path.write_text(yaml.safe_dump(config))
+    records = [{"chunk_id": str(i)} for i in range(count)]
+    last = records[-1]
+    last.update({f"padding_{i}": "" for i in range(14)})
+    formatted = [{"@timestamp": 1.0, **record} for record in records]
+    remaining = 1000000 - len(json.dumps(formatted, separators=(",", ":")).encode())
+    for i in range(14):
+        size = min(60000, remaining)
+        last[f"padding_{i}"] = "x" * size
+        remaining -= size
+    assert remaining == 0
+    gates = Gates(monkeypatch)
+    try:
+        service.start()
+        log_path = Path(service.flb.log_file)
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+            barriers = 0
+            for start in range(0, count, 128):
+                end = min(start + 128, count)
+                connection.sendall(b"".join(
+                    b"\x93" + _pack_obj(f"chunk.{i}") + b"\x01" + _pack_obj(records[i])
+                    for i in range(start, end)))
+                service.service.wait_for_condition(
+                    lambda: log_path.read_text().count("created task=") >= end + barriers,
+                    timeout=30, interval=0.02, description=f"{end} Azure tasks created")
+                # A subsequently queued null flush fences the shared dispatch pipe.
+                # Azure callbacks cannot finish yet: the HTTP response is still held.
+                connection.sendall(b"\x93" + _pack_obj("barrier") + b"\x01" +
+                                   _pack_obj({"marker": "admitted"}))
+                barriers += 1
+                service.service.wait_for_condition(
+                    lambda: log_path.read_text().count("[task] destroy task=") >= barriers,
+                    timeout=30, interval=0.02, description=f"{end} Azure callbacks admitted")
+        item = gates.wait(service, 1)
+        assert item["json_size"] == 1000000
+        assert item["encoding"] == ("gzip" if compress else None)
+        assert collections.Counter(r["chunk_id"] for r in item["records"]) == collections.Counter(
+            r["chunk_id"] for r in records)
+        for received in item["records"]:
+            assert received == {"@timestamp": 1.0, **records[int(received["chunk_id"])]}
+        assert len(gates.requests) == 1
+        assert metrics(service)["proc_records"] == 0
+        labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite"}
+        service.service.wait_for_condition(
+            lambda: request_metric(service, CHUNKS + "_sum", **labels) == count,
+            timeout=10, interval=0.02, description="all batch members in metrics snapshot")
+        item["status"] = status
+        logging.getLogger(__name__).info("releasing HTTP %d for %d chunk callbacks", status, count)
+        released = time.monotonic()
+        item["gate"].set()
+        counter = "proc_records" if status == 204 else "dropped_records"
+        service.service.wait_for_condition(
+            lambda: metrics(service)[counter] == count,
+            timeout=60, interval=0.02, description="all completion notifications drained")
+        logging.getLogger(__name__).info("retired %d chunk callbacks in %.6fs after HTTP %d",
+                                         count, time.monotonic() - released, status)
+        assert service.flb.process.poll() is None
+        assert len(gates.requests) == 1
+        service.service.wait_for_condition(
+            lambda: request_metric(service, RESPONSES, **labels, status=str(status)) == 1,
+            timeout=10, interval=0.02, description="completed response in metrics snapshot")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
 
 
 def sized_record(chunk_id, field_count=10, field_size=40000):
