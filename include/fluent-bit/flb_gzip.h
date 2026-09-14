@@ -25,25 +25,6 @@
 #include <monkey/mk_http.h>
 
 struct flb_decompression_context;
-struct flb_gzip_stream;
-
-/*
- * Incremental gzip compression. Append consumes all borrowed input before
- * returning success; NULL input is valid only for zero length. emitted_size
- * includes the header, but not pending DEFLATE output or the eventual trailer.
- * It is a soft sizing signal, not the final body's size or an upper bound.
- *
- * Finish transfers an owned body (release with flb_free) and its exact length,
- * and releases compressor state. Finish is allowed once. Any failed operation
- * poisons the stream; only destroy is then valid. Destroy also accepts NULL.
- * Operations return 0 on success and -1 on failure.
- */
-struct flb_gzip_stream *flb_gzip_stream_create(void);
-int flb_gzip_stream_append(struct flb_gzip_stream *stream,
-                           const void *data, size_t len, size_t *emitted_size);
-int flb_gzip_stream_finish(struct flb_gzip_stream *stream,
-                           void **out_data, size_t *out_len);
-void flb_gzip_stream_destroy(struct flb_gzip_stream *stream);
 
 int flb_gzip_compress(void *in_data, size_t in_len,
                       void **out_data, size_t *out_len);
