@@ -253,6 +253,7 @@ endif()
 
 
 # Output Plugins
+FLB_RT_TEST(FLB_OUT_AZURE_LOGS_INGESTION "out_azure_logs_ingestion_gzip.c")
 if(FLB_IN_LIB)
   FLB_RT_TEST(FLB_OUT_LIB              "core_engine.c")
   FLB_RT_TEST(FLB_OUT_LIB              "core_log.c")
@@ -393,6 +394,13 @@ foreach(source_file ${CHECK_PROGRAMS})
     set_property(TARGET ${source_file_we} APPEND_STRING PROPERTY COMPILE_FLAGS "-D${o_source_file_we}")
   endif()
 endforeach()
+
+if(TARGET flb-rt-out_azure_logs_ingestion_gzip)
+  target_sources(flb-rt-out_azure_logs_ingestion_gzip PRIVATE
+    ${PROJECT_SOURCE_DIR}/plugins/out_azure_logs_ingestion/azure_logs_ingestion_gzip.c)
+  target_include_directories(flb-rt-out_azure_logs_ingestion_gzip PRIVATE
+    ${PROJECT_SOURCE_DIR}/plugins/out_azure_logs_ingestion)
+endif()
 
 function(flb_runtime_lock_tests resource_name)
   foreach(test_name ${ARGN})
