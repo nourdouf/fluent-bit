@@ -41,6 +41,7 @@
 
 #include "azure_logs_ingestion.h"
 #include "azure_logs_ingestion_conf.h"
+#include "azure_logs_ingestion_gzip.h"
 
 #define AZ_LI_BATCH_DISPATCH_LIMIT 64
 
@@ -605,7 +606,7 @@ struct az_li_batch {
     int count;
     size_t json_size;
     size_t emitted_size;
-    struct flb_gzip_stream *gzip;
+    struct az_li_gzip_stream *gzip;
     int references;
     int result;
     uint64_t deadline;
@@ -696,7 +697,7 @@ static int az_li_batch_dispatch(void *data)
 
 static void az_li_batch_plain(struct flb_az_li *ctx, struct az_li_batch *batch)
 {
-    flb_gzip_stream_destroy(batch->gzip);
+    az_li_gzip_stream_destroy(batch->gzip);
     batch->gzip = NULL;
     flb_plg_warn(ctx->ins, "cannot stream gzip payload, using plain JSON for this batch");
 }
@@ -715,10 +716,10 @@ static void az_li_batch_append(struct flb_az_li *ctx, struct az_li_batch *batch,
     member->comma = batch->json_size > 2;
     batch->json_size += interior + member->comma;
     if (batch->gzip &&
-        ((member->comma && flb_gzip_stream_append(batch->gzip, ",", 1,
-                                                  &batch->emitted_size) != 0) ||
-         flb_gzip_stream_append(batch->gzip, member->formatted + 1, interior,
-                                &batch->emitted_size) != 0)) {
+        ((member->comma && az_li_gzip_stream_append(batch->gzip, ",", 1,
+                                                    &batch->emitted_size) != 0) ||
+         az_li_gzip_stream_append(batch->gzip, member->formatted + 1, interior,
+                                  &batch->emitted_size) != 0)) {
         az_li_batch_plain(ctx, batch);
     }
 }
@@ -782,15 +783,15 @@ static int az_li_batch_prepare(struct flb_az_li *ctx, struct az_li_batch *batch,
 
     body->json_size = batch->json_size;
     if (batch->gzip) {
-        ret = flb_gzip_stream_append(batch->gzip, "]", 1, &batch->emitted_size);
+        ret = az_li_gzip_stream_append(batch->gzip, "]", 1, &batch->emitted_size);
         if (ret == 0) {
-            ret = flb_gzip_stream_finish(batch->gzip, &body->data, &body->size);
+            ret = az_li_gzip_stream_finish(batch->gzip, &body->data, &body->size);
         }
         if (ret != 0) {
             az_li_batch_plain(ctx, batch);
         }
         else {
-            flb_gzip_stream_destroy(batch->gzip);
+            az_li_gzip_stream_destroy(batch->gzip);
             batch->gzip = NULL;
             if (body->json_size > FLB_AZ_LI_MAX_BODY_BYTES ||
                 body->size <= FLB_AZ_LI_MAX_BODY_BYTES) {
@@ -879,9 +880,9 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         batch = replacement;
         ctx->collecting = batch;
         if (ctx->compress_enabled) {
-            batch->gzip = flb_gzip_stream_create();
+            batch->gzip = az_li_gzip_stream_create();
             if (!batch->gzip ||
-                flb_gzip_stream_append(batch->gzip, "[", 1, &batch->emitted_size) != 0) {
+                az_li_gzip_stream_append(batch->gzip, "[", 1, &batch->emitted_size) != 0) {
                 az_li_batch_plain(ctx, batch);
             }
         }
