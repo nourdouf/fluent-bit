@@ -61,8 +61,9 @@ def stop_checked(service):
 
 
 class Gates:
-    def __init__(self, monkeypatch, max_bytes=None):
+    def __init__(self, monkeypatch, max_bytes=None, gate_timeout=30):
         self.max_bytes = max_bytes
+        self.gate_timeout = gate_timeout
         self.requests = []
         self.errors = []
         self.closing = threading.Event()
@@ -94,7 +95,7 @@ class Gates:
             return "request exceeds service limit", 413
         if self.closing.is_set():
             gate.set()
-        if not gate.wait(30):
+        if not gate.wait(self.gate_timeout):
             self.errors.append("response gate expired")
         return "{}", item["status"], {"Content-Type": "application/json"}
 
@@ -115,14 +116,20 @@ class Gates:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux engine drain semantics")
 @pytest.mark.parametrize("transition", ["stop", "reload"])
-@pytest.mark.parametrize("pending", ["collecting", "ingestion", "oauth"])
-def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pending, transition):
+@pytest.mark.parametrize("pending,batching", [
+    ("collecting", True), ("ingestion", True), ("oauth", True),
+    ("ingestion", False), ("oauth", False),
+])
+def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pending,
+                                                       transition, batching):
     service = batch_service(tmp_path, count=0, wait_ms=60000)
     port = service.service.allocate_port_env("TEST_LIFECYCLE_INPUT_PORT")
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"].update({"flush": 0.05, "grace": 8, "hot_reload": "on"})
     config["pipeline"]["outputs"][0].update({"time_generated": True, "batch_target_size": 1000000})
+    if not batching:
+        del config["pipeline"]["outputs"][0]["batch_wait_ms"]
     # Leave hot_reload.ensure_thread_safety at its default (on).
     config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
     path.write_text(yaml.safe_dump(config))
@@ -166,6 +173,8 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     # Three 333334-byte arrays assemble to exactly 1000000 bytes. Nine chunks
     # close three batches: one refresh owner and two waiting senders.
     count = {"collecting": 2, "ingestion": 3, "oauth": 9}[pending]
+    request_count = (count + 2) // 3 if batching else count
+    followup_requests = 1 if batching else 3
     expected = collections.Counter(range(count))
     try:
         service.start()
@@ -175,8 +184,8 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
             wait(lambda: len(re.findall(r"\[task\] created task=.* OK", log_text()))
                  == chunk_id + 1, f"engine task for chunk {chunk_id}")
         if pending == "ingestion":
-            gates.wait(service, 1)
-            assert len(gates.requests) == 1
+            gates.wait(service, request_count)
+            assert len(gates.requests) == request_count
         elif pending == "oauth":
             wait(token_started.is_set, "refresh owner held in OAuth")
             assert len(token_requests) == 1
@@ -206,7 +215,7 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
         if transition == "reload":
             service.flb.wait_for_hot_reload_count(1, timeout=30)
             old_log = log_text().split("[reload] start everything", 1)[0]
-            assert old_log.count("http_status=200") == (count + 2) // 3
+            assert old_log.count("http_status=200") == request_count
             assert len(token_requests) == 1
             assert collections.Counter(r["chunk_id"] for item in gates.requests
                                        for r in item["records"]) == expected
@@ -222,7 +231,7 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     assert not gates.errors
     assert collections.Counter(r["chunk_id"] for item in gates.requests
                                for r in item["records"]) == expected
-    assert len(gates.requests) == (count + 2) // 3 + (transition == "reload")
+    assert len(gates.requests) == request_count + followup_requests * (transition == "reload")
     assert len(token_requests) == 1 + (transition == "reload")
     log = log_text()
     assert log.count("http_status=200") == len(gates.requests)
