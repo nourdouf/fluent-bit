@@ -23,6 +23,9 @@ from server.forward_server import _pack_obj
 from test_out_azure_logs_ingestion_001 import Service
 
 
+WIRE_LIMIT = 1048576
+
+
 def batch_service(tmp_path, count=3, wait_ms=5000, chunk_bytes=None):
     service = Service("out_azure_logs_ingestion_oauth2.yaml")
     with open(service.config_file) as config_file:
@@ -99,7 +102,7 @@ class Gates:
             self.requests.append(item)
         logging.getLogger(__name__).info("request payload bytes: wire=%d json=%d encoding=%s",
                                          raw_size, len(body), encoding)
-        if self.max_bytes is not None and max(raw_size, len(body)) > self.max_bytes:
+        if self.max_bytes is not None and raw_size > self.max_bytes:
             item["status"] = 413
             return "request exceeds service limit", 413
         if self.closing.is_set():
@@ -136,7 +139,8 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"].update({"flush": 0.05, "grace": 8, "hot_reload": "on"})
-    config["pipeline"]["outputs"][0].update({"time_generated": True, "batch_target_size": 1000000})
+    config["pipeline"]["outputs"][0].update(
+        {"time_generated": True, "compress": "off", "batch_target_size": 1000000})
     if not batching:
         del config["pipeline"]["outputs"][0]["batch_wait_ms"]
     # Leave hot_reload.ensure_thread_safety at its default (on).
@@ -262,7 +266,7 @@ def test_large_batch_completion_keeps_engine_responsive(tmp_path, monkeypatch, c
          "buffer_max_size": "2M", "buffer_chunk_size": "1M"}]
     config["pipeline"]["outputs"][0].update(
         {"compress": compress, "time_generated": False,
-         "batch_target_size": 1000000, "retry_limit": "no_retries"})
+         "batch_target_size": 100000 if compress else 1000000, "retry_limit": "no_retries"})
     config["pipeline"]["outputs"].append({"name": "null", "match": "barrier", "workers": 0})
     path.write_text(yaml.safe_dump(config))
     records = [{"chunk_id": str(i)} for i in range(count)]
@@ -272,7 +276,9 @@ def test_large_batch_completion_keeps_engine_responsive(tmp_path, monkeypatch, c
     remaining = 1000000 - len(json.dumps(formatted, separators=(",", ":")).encode())
     for i in range(14):
         size = min(60000, remaining)
-        last[f"padding_{i}"] = "x" * size
+        last[f"padding_{i}"] = (''.join(random.Random(i).choices(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=size))
+            if compress else "x" * size)
         remaining -= size
     assert remaining == 0
     gates = Gates(monkeypatch)
@@ -351,6 +357,110 @@ def exact_size_record(chunk_id, array_bytes):
     return record
 
 
+def entropy_record(chunk_id, array_bytes, random_fraction=1.0):
+    record = exact_size_record(chunk_id, array_bytes)
+    rng = random.Random(chunk_id)
+    alphabet = ''.join(chr(value) for value in range(32, 127) if chr(value) not in '\\"')
+    for key, value in record.items():
+        if key.startswith("field_"):
+            size = int(len(value) * random_fraction)
+            record[key] = ''.join(rng.choices(alphabet, k=size)) + "x" * (len(value) - size)
+    return record
+
+
+def test_gzip_target_aggregates_multiple_raw_megabytes(tmp_path, monkeypatch):
+    count = 10
+    service = batch_service(tmp_path, count=count, wait_ms=10000)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    expected = {i: entropy_record(i, 600001, random_fraction=0.25) for i in range(count)}
+    for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
+        source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
+    config["pipeline"]["outputs"][0].update({"time_generated": True, "compress": "on"})
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch, max_bytes=WIRE_LIMIT)
+    try:
+        service.start()
+        item = gates.wait(service, 1)
+        assert item["encoding"] == "gzip"
+        assert 800000 <= item["raw_size"] <= WIRE_LIMIT
+        assert item["json_size"] > 3 * WIRE_LIMIT
+        assert len(item["records"]) > 2
+        assert metrics(service)["proc_records"] == 0
+        closed = re.search(r"batch closed: deadline=(\d+) now=(\d+)",
+                           Path(service.flb.log_file).read_text())
+        assert closed is not None
+        assert int(closed[2]) < int(closed[1])
+        gates.release_all()
+        service.service.wait_for_condition(
+            lambda: metrics(service)["proc_records"] == count,
+            timeout=20, description="all large raw chunks delivered before shutdown")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+    assert collections.Counter(r["chunk_id"] for item in gates.requests
+                               for r in item["records"]) == collections.Counter(expected.keys())
+    for item in gates.requests:
+        assert item["raw_size"] <= WIRE_LIMIT
+        assert item["encoding"] == "gzip"
+        for record in item["records"]:
+            assert {k: v for k, v in record.items() if k != "@timestamp"} == expected[record["chunk_id"]]
+
+
+@pytest.mark.parametrize("compress", ["off", "on"])
+@pytest.mark.parametrize("failed_status", [None, 503])
+def test_overflow_rebuild_preserves_independent_chunk_outcomes(tmp_path, monkeypatch,
+                                                             compress, failed_status):
+    service = batch_service(tmp_path, count=0, wait_ms=2000)
+    port = service.service.allocate_port_env("TEST_REBUILD_INPUT_PORT")
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"].update({"flush": 0.05, "scheduler.base": 1, "scheduler.cap": 1})
+    config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
+    config["pipeline"]["outputs"][0].update(
+        {"time_generated": True, "compress": compress, "retry_limit": 1})
+    path.write_text(yaml.safe_dump(config))
+    expected = {i: entropy_record(i, 700001) for i in range(2)}
+    gates = Gates(monkeypatch, max_bytes=WIRE_LIMIT)
+    try:
+        service.start()
+        for chunk_id, record in expected.items():
+            response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}", json=record, timeout=5)
+            response.raise_for_status()
+            service.service.wait_for_condition(
+                lambda: Path(service.flb.log_file).read_text().count("created task=") == chunk_id + 1,
+                timeout=10, description="separate overflow chunk admitted")
+        gates.wait(service, 2)
+        assert len(gates.requests) == 2
+        assert metrics(service)["proc_records"] == 0
+        by_id = {item["records"][0]["chunk_id"]: item for item in gates.requests}
+        assert set(by_id) == {0, 1}
+        by_id[1]["gate"].set()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 1,
+                                           timeout=10, description="only removed chunk acknowledged")
+        assert not by_id[0]["gate"].is_set()
+        by_id[0]["status"] = failed_status or 200
+        by_id[0]["gate"].set()
+        if failed_status:
+            retry = gates.wait(service, 3)
+            assert [r["chunk_id"] for r in retry["records"]] == [0]
+            retry["gate"].set()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
+                                           timeout=10, description="both overflow chunks acknowledged")
+        assert metrics(service)["retries"] == (1 if failed_status else 0)
+        for item in gates.requests:
+            assert len(item["records"]) == 1
+            assert item["raw_size"] <= WIRE_LIMIT
+            assert item["encoding"] == ("gzip" if compress == "on" else None)
+            record = item["records"][0]
+            assert {k: v for k, v in record.items() if k != "@timestamp"} == expected[record["chunk_id"]]
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
+
+
 @pytest.mark.parametrize("compress", ["off", "on"])
 def test_omitted_batch_target_uses_800000_bytes(tmp_path, monkeypatch, compress):
     service = batch_service(tmp_path, count=2, wait_ms=4000)
@@ -415,10 +525,10 @@ def assert_target_requests(gates, expected, sizes):
 @pytest.mark.parametrize("compress", ["off", "on"])
 @pytest.mark.parametrize("target,sizes,wait_ms", [
     pytest.param(600000, [900001], 4000, id="smaller"),
-    pytest.param(1000000, [900001], 4000, id="maximum"),
-    pytest.param("+1000000", [900001], 4000, id="leading-plus"),
+    pytest.param(WIRE_LIMIT, [900001], 4000, id="maximum"),
+    pytest.param("+1048576", [900001], 4000, id="leading-plus"),
     # Configuration normalizes whitespace before plugin parsing.
-    pytest.param(" 1000000", [900001], 4000, id="leading-space"),
+    pytest.param(" 1048576", [900001], 4000, id="leading-space"),
     pytest.param(1, [450001, 450001], 60000, id="minimum"),
     pytest.param(2, [450001, 450001], 60000, id="array-envelope"),
 ])
@@ -565,8 +675,8 @@ def test_emitted_gzip_target_closes_before_timer_or_raw_ceiling(tmp_path, monkey
             assert {k: v for k, v in record.items() if k != "@timestamp"} == expected[record["chunk_id"]]
 
 
-def test_compressible_batch_raw_ceiling_preempts_gzip_target(tmp_path, monkeypatch):
-    service = batch_service(tmp_path, count=3, wait_ms=60000)
+def test_compressible_batch_can_exceed_raw_megabyte(tmp_path, monkeypatch):
+    service = batch_service(tmp_path, count=3, wait_ms=2000)
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
@@ -578,15 +688,15 @@ def test_compressible_batch_raw_ceiling_preempts_gzip_target(tmp_path, monkeypat
         service.start()
         item = gates.wait(service, 1)
         assert item["encoding"] == "gzip"
-        assert item["json_size"] == 800001
+        assert item["json_size"] == 1200001
         assert item["raw_size"] < 800000
-        assert len(item["records"]) == 2
+        assert len(item["records"]) == 3
         assert metrics(service)["proc_records"] == 0
     finally:
         gates.release_all()
         stop_checked(service)
     assert not gates.errors
-    assert sorted(item["json_size"] for item in gates.requests) == [400001, 800001]
+    assert [item["json_size"] for item in gates.requests] == [1200001]
     assert collections.Counter(r["chunk_id"] for item in gates.requests
                                for r in item["records"]) == {0: 1, 1: 1, 2: 1}
 
@@ -603,7 +713,7 @@ def test_hard_valid_chunk_can_overshoot_soft_target_with_peer(tmp_path, monkeypa
     path.write_text(yaml.safe_dump(config))
     sizes = [100001, 850001, 100001]
     expected = {i: exact_size_record(i, size) for i, size in enumerate(sizes)}
-    request_sizes = [950001, 100001]
+    request_sizes = [1050001] if compress == "on" else [950001, 100001]
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
         service.start()
@@ -615,9 +725,10 @@ def test_hard_valid_chunk_can_overshoot_soft_target_with_peer(tmp_path, monkeypa
                 lambda: len(re.findall(r"\[task\] created task=.* OK",
                                        Path(service.flb.log_file).read_text())) == chunk_id + 1,
                 timeout=10, interval=0.02, description=f"separate target-test chunk {chunk_id}")
-        gates.wait(service, 2)
+        gates.wait(service, len(request_sizes))
         assert_target_requests(gates, expected, request_sizes)
-        assert [[r["chunk_id"] for r in item["records"]] for item in gates.requests] == [[0, 1], [2]]
+        assert [[r["chunk_id"] for r in item["records"]] for item in gates.requests] == (
+            [[0, 1, 2]] if compress == "on" else [[0, 1], [2]])
         assert metrics(service)["proc_records"] == 0
         gates.release_all()
         service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 3,
@@ -673,20 +784,20 @@ def test_whole_chunks_respect_service_byte_ceiling(tmp_path, monkeypatch, compre
         service.start()
         gates.wait(service, 1)
         # Check the receiver's actual bytes, not an estimate of MessagePack size.
-        assert all(item["raw_size"] <= 1000000 and item["json_size"] <= 1000000
+        assert all(item["raw_size"] <= WIRE_LIMIT
                    for item in gates.requests), [
                        (item["raw_size"], item["json_size"]) for item in gates.requests]
         gates.release_all()
         service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 3,
                                            timeout=15, description="all size-valid chunks delivered")
-        assert len(gates.requests) == 2
-        assert sorted(len(item["records"]) for item in gates.requests) == [1, 2]
+        assert len(gates.requests) == (1 if compress == "on" else 2)
+        assert sorted(len(item["records"]) for item in gates.requests) == (
+            [3] if compress == "on" else [1, 2])
         assert collections.Counter(record["chunk_id"] for item in gates.requests
                                    for record in item["records"]) == {0: 1, 1: 1, 2: 1}
         for item in gates.requests:
             assert item["status"] == 200
             assert item["raw_size"] <= 1000000
-            assert item["json_size"] <= 1000000
             for record in item["records"]:
                 expected = sized_record(record["chunk_id"])
                 assert {key: record[key] for key in expected} == expected
@@ -705,14 +816,14 @@ def test_byte_closed_sender_does_not_acknowledge_next_collecting_chunk(tmp_path,
     config = yaml.safe_load(path.read_text())
     config["service"]["flush"] = 0.05
     config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
-    config["pipeline"]["outputs"][0].update({"compress": compress, "batch_target_size": 1000000})
+    config["pipeline"]["outputs"][0].update({"compress": compress, "batch_target_size": 600000})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
         service.start()
         for chunk_id in range(3):
             response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
-                                     json=sized_record(chunk_id), timeout=5)
+                                     json=entropy_record(chunk_id, 400001), timeout=5)
             response.raise_for_status()
             service.service.wait_for_condition(
                 lambda: len(re.findall(r"\[task\] created task=.* OK",
@@ -742,22 +853,21 @@ def test_byte_closed_sender_does_not_acknowledge_next_collecting_chunk(tmp_path,
     assert not gates.errors
 
 
-@pytest.mark.parametrize("compress", ["off", "on"])
-def test_exact_service_limit_closes_without_collection_expiry(tmp_path, monkeypatch, compress):
+def test_exact_service_limit_closes_without_collection_expiry(tmp_path, monkeypatch):
     service = batch_service(tmp_path, wait_ms=60000)
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
-        source.update({"dummy": json.dumps(exact_size_record(chunk_id, 333334)), "copies": 1})
+        source.update({"dummy": json.dumps(exact_size_record(chunk_id, 349526)), "copies": 1})
     config["pipeline"]["outputs"][0].update(
-        {"time_generated": True, "compress": compress, "batch_target_size": 1000000})
+        {"time_generated": True, "compress": "off", "batch_target_size": WIRE_LIMIT})
     path.write_text(yaml.safe_dump(config))
-    gates = Gates(monkeypatch, max_bytes=1000000)
+    gates = Gates(monkeypatch, max_bytes=WIRE_LIMIT)
     try:
         service.start()
         item = gates.wait(service, 1)  # Receiver wait is shorter than the 60s collection deadline.
-        assert item["json_size"] == 1000000
-        assert item["raw_size"] <= 1000000
+        assert item["json_size"] == WIRE_LIMIT
+        assert item["raw_size"] == WIRE_LIMIT
         assert collections.Counter(r["chunk_id"] for r in item["records"]) == {0: 1, 1: 1, 2: 1}
         assert metrics(service)["proc_records"] == 0
         item["gate"].set()
@@ -783,17 +893,17 @@ def test_oversized_single_chunk_isolated_and_retried(tmp_path, monkeypatch, comp
     gates = Gates(monkeypatch, max_bytes=1000000)
     try:
         service.start()
-        for chunk_id, fields in [(0, 10), (1, 30), (2, 10)]:
+        for chunk_id, size in [(0, 400001), (1, 1600001), (2, 400001)]:
             response = requests.post(f"http://127.0.0.1:{port}/chunk.{chunk_id}",
-                                     json=sized_record(chunk_id, field_count=fields), timeout=5)
+                                     json=entropy_record(chunk_id, size), timeout=5)
             response.raise_for_status()
         gates.wait(service, 1)
         gates.release_all()
         service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2 and
                                            metrics(service)["retries_failed"] == 1,
                                            timeout=15, description="valid peers delivered; singleton retry exhausted")
-        oversized = [item for item in gates.requests if item["json_size"] > 1000000]
-        valid = [item for item in gates.requests if item["json_size"] <= 1000000]
+        oversized = [item for item in gates.requests if item["raw_size"] > WIRE_LIMIT]
+        valid = [item for item in gates.requests if item["raw_size"] <= WIRE_LIMIT]
         assert len(oversized) == 2
         assert all([r["chunk_id"] for r in item["records"]] == [1] for item in oversized)
         assert all(item["status"] == 413 for item in oversized)
@@ -836,7 +946,7 @@ def test_closed_batches_complete_independently(tmp_path, monkeypatch):
     service = batch_service(tmp_path, count=6, wait_ms=2000, chunk_bytes=330000)
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
-    config["pipeline"]["outputs"][0]["batch_target_size"] = 1000000
+    config["pipeline"]["outputs"][0].update({"batch_target_size": 900000, "compress": "off"})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch)
     try:
@@ -958,7 +1068,7 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     pytest.param({"batch_target_size": target, **wait_options},
                  id=f"target-{label}-{mode}")
     for target, label in [(" ", "blank"), (0, "zero"), (-1, "negative"),
-                          (1000001, "above-ceiling"), ("999999999999999999999", "overflow"),
+                          (1048577, "above-ceiling"), ("999999999999999999999", "overflow"),
                           ("800000junk", "junk"), ("800K", "suffix"), ("800000.5", "fraction")]
     for wait_options, mode in [({}, "unbatched"), ({"batch_wait_ms": 1000}, "batched")]
 ])
@@ -996,7 +1106,7 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         # Space-only values fail in YAML parsing, before plugin initialization.
         assert "unable to add variant value property" in report
     elif "batch_target_size" in options:
-        assert "batch_target_size must be an integer from 1 to 1000000 bytes" in report
+        assert "batch_target_size must be an integer from 1 to 1048576 bytes" in report
     else:
         assert "batching requires positive batch_wait_ms and workers=0" in report
     if leaks_enabled():
@@ -1048,7 +1158,8 @@ def test_batch_timer_rearms_and_releases_after_delivery(tmp_path, monkeypatch):
     path = Path(service.service.config_path)
     config = yaml.safe_load(path.read_text())
     config["service"]["flush"] = 0.1
-    config["pipeline"]["outputs"][0].update({"time_generated": True, "batch_target_size": 1000000})
+    config["pipeline"]["outputs"][0].update(
+        {"time_generated": True, "compress": "off", "batch_target_size": 1000000})
     config["pipeline"]["inputs"] = [
         {"name": "http", "listen": "127.0.0.1", "port": port}]
     path.write_text(yaml.safe_dump(config))

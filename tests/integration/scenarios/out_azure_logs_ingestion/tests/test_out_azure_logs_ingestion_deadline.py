@@ -148,6 +148,7 @@ def test_native_timeout_preserves_busy_connection_count(tmp_path, count):
 
 def test_token_refresh_is_single_flight_and_keeps_engine_responsive(tmp_path, monkeypatch):
     service, port = timeout_service(tmp_path)
+    set_output(service, batch_target_size=1)
     token_times = []
     original = http_server.app.view_functions["oauth_token"]
 
