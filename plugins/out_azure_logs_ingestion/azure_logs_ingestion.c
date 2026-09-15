@@ -99,7 +99,7 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
         if (az_li_positive_option(flb_output_get_property("batch_target_size", ins),
                                   &ctx->batch_target_size) != 0 ||
             ctx->batch_target_size > FLB_AZ_LI_MAX_BODY_BYTES) {
-            flb_plg_error(ins, "batch_target_size must be an integer from 1 to 1000000 bytes");
+            flb_plg_error(ins, "batch_target_size must be an integer from 1 to 1048576 bytes");
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
@@ -431,7 +431,7 @@ struct az_li_body {
     int compressed;
 };
 
-/* Unbatched mode keeps its one-shot compression and bounded-JSON fallback. */
+/* Unbatched mode keeps its one-shot compression. */
 static void az_li_prepare_single(struct flb_az_li *ctx, flb_sds_t json,
                                  struct az_li_body *body)
 {
@@ -447,11 +447,6 @@ static void az_li_prepare_single(struct flb_az_li *ctx, flb_sds_t json,
     }
     if (flb_gzip_compress(json, body->size, &compressed, &compressed_size) != 0) {
         flb_plg_error(ctx->ins, "cannot gzip payload, disabling compression");
-        return;
-    }
-    if (body->json_size <= FLB_AZ_LI_MAX_BODY_BYTES &&
-        compressed_size > FLB_AZ_LI_MAX_BODY_BYTES) {
-        flb_free(compressed);
         return;
     }
     body->data = compressed;
@@ -758,9 +753,8 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     size_t total = batch->json_size;
     size_t offset = 1;
 
-    /* Consume the retained arrays, including on allocation failure. The callbacks
-     * keep engine chunk ownership, but no formatted arrays survive assembly. */
-    /* SDS adds its allocation header and a NUL terminator. */
+    /* Keep member arrays until final size selection permits network IO.
+     * SDS adds its allocation header and a NUL terminator. */
     if (total > SIZE_MAX - FLB_SDS_HEADER_SIZE - 1) {
         goto cleanup;
     }
@@ -785,7 +779,6 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     flb_sds_len_set(combined, offset);
 
 cleanup:
-    az_li_batch_release_json(batch);
     return combined;
 }
 
@@ -806,22 +799,90 @@ static int az_li_batch_prepare(struct flb_az_li *ctx, struct az_li_batch *batch,
         else {
             az_li_gzip_stream_destroy(batch->gzip);
             batch->gzip = NULL;
-            if (body->json_size > FLB_AZ_LI_MAX_BODY_BYTES ||
-                body->size <= FLB_AZ_LI_MAX_BODY_BYTES) {
-                body->compressed = FLB_TRUE;
-                az_li_batch_release_json(batch);
-                return 0;
-            }
-            /* Finalization can expand bounded raw JSON past the wire ceiling.
-             * Retained arrays preserve plain fallback without guessed reserves. */
-            flb_free(body->data);
-            body->data = NULL;
+            body->compressed = FLB_TRUE;
+            return 0;
         }
     }
     body->compressed = FLB_FALSE;
     body->data = az_li_batch_format(batch);
     body->size = body->data ? flb_sds_len(body->data) : 0;
     return body->data ? 0 : -1;
+}
+
+static void az_li_batch_rebuild(struct flb_az_li *ctx, struct az_li_batch *batch)
+{
+    struct mk_list *head;
+    struct az_li_member *member;
+
+    az_li_gzip_stream_destroy(batch->gzip);
+    batch->gzip = NULL;
+    batch->json_size = 2;
+    batch->emitted_size = 0;
+    if (ctx->compress_enabled) {
+        batch->gzip = az_li_gzip_stream_create();
+        if (!batch->gzip ||
+            az_li_gzip_stream_append(batch->gzip, "[", 1, &batch->emitted_size) != 0) {
+            az_li_batch_plain(ctx, batch);
+        }
+    }
+    mk_list_foreach(head, &batch->members) {
+        member = mk_list_entry(head, struct az_li_member, member_link);
+        member->comma = 0;
+        az_li_batch_append(ctx, batch, member, flb_sds_len(member->formatted));
+    }
+}
+
+static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch *batch,
+                                       struct az_li_body *body)
+{
+    struct az_li_batch *remainder = NULL;
+    struct az_li_member *member;
+    int ret;
+
+    while (1) {
+        ret = az_li_batch_prepare(ctx, batch, body);
+        if (ret != 0 || body->size <= FLB_AZ_LI_MAX_BODY_BYTES || batch->count == 1) {
+            break;
+        }
+        if (body->compressed) {
+            flb_free(body->data);
+        }
+        else {
+            flb_sds_destroy(body->data);
+        }
+        memset(body, 0, sizeof(*body));
+        if (!remainder) {
+            remainder = flb_calloc(1, sizeof(*remainder));
+            if (!remainder) {
+                ret = -1;
+                break;
+            }
+            mk_list_init(&remainder->members);
+            remainder->deadline = batch->deadline;
+        }
+        /* Only trailing members move, so the active sender stays in this batch.
+         * Prepend to preserve the original order across repeated removals. */
+        member = mk_list_entry_last(&batch->members, struct az_li_member, member_link);
+        mk_list_del(&member->member_link);
+        mk_list_add_before(&member->member_link, remainder->members.next, &remainder->members);
+        member->batch = remainder;
+        batch->count--;
+        batch->references--;
+        remainder->count++;
+        remainder->references++;
+        az_li_batch_rebuild(ctx, batch);
+    }
+    if (remainder) {
+        /* Removed chunks keep their own callbacks and request outcome. They are
+         * already overdue or size-closed, not a new collection window. */
+        az_li_batch_rebuild(ctx, remainder);
+        member = mk_list_entry_first(&remainder->members, struct az_li_member, member_link);
+        member->send = FLB_TRUE;
+        mk_list_del(&member->parked_link);
+        mk_list_add(&member->parked_link, &ctx->batch_ready);
+        az_li_notify(ctx);
+    }
+    return ret;
 }
 
 static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
@@ -862,11 +923,13 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     }
 
     batch = ctx->collecting;
-    /* Only the raw hard ceiling prevents admission. Collecting JSON is strictly
-     * below it; even an empty batch must not absorb an over-hard singleton. */
-    if (!batch || size > FLB_AZ_LI_MAX_BODY_BYTES ||
-        (size > 2 && size - 2 > FLB_AZ_LI_MAX_BODY_BYTES - batch->json_size -
-                               (batch->json_size > 2))) {
+    if (batch && (batch->count == INT_MAX ||
+                  (size > 2 && size - 2 > SIZE_MAX - batch->json_size -
+                                         (batch->json_size > 2)))) {
+        flb_sds_destroy(member.formatted);
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+    if (!batch) {
         replacement = flb_calloc(1, sizeof(*replacement));
         if (!replacement) {
             flb_sds_destroy(member.formatted);
@@ -911,7 +974,6 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     batch->references++;
     az_li_batch_append(ctx, batch, &member, size);
     if ((batch->gzip ? batch->emitted_size : batch->json_size) >= ctx->batch_target_size ||
-        batch->json_size >= FLB_AZ_LI_MAX_BODY_BYTES ||
         az_li_now_ms() >= batch->deadline || config->is_shutting_down) {
         az_li_batch_close(ctx);
     }
@@ -920,8 +982,11 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         flb_coro_yield(member.coro, FLB_FALSE);
     }
 
+    /* Overflow rebuilding can move a parked member to a different closed batch. */
+    batch = member.batch;
     if (member.send) {
-        result = az_li_batch_prepare(ctx, batch, &body);
+        result = az_li_batch_prepare_bounded(ctx, batch, &body);
+        az_li_batch_release_json(batch);
         batch->result = result == 0 ? az_li_send(ctx, &body, batch->count) : FLB_RETRY;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
         mk_list_foreach(head, &batch->members) {
@@ -1010,9 +1075,9 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "batch_target_size", "800000",
      0, FLB_FALSE, 0,
-     "Soft outgoing-body target in bytes, from 1 to 1000000 without size suffixes. "
+     "Soft outgoing-body target in bytes, from 1 to 1048576 without size suffixes. "
      "Close after whole-chunk admission when emitted gzip bytes, or plain JSON bytes, reach the target. "
-     "The independent 1000000-byte raw ceiling may close a batch before the target. "
+     "Rebuild oversized aggregates at whole-chunk boundaries to fit the 1048576-byte wire limit. "
      "Does not enable batching without batch_wait_ms."
     },
     /* optional params */

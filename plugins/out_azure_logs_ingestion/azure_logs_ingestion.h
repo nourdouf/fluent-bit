@@ -33,8 +33,8 @@
 #define FLB_AZ_LI_TLS_MODE          FLB_IO_TLS
 /* refresh token every 60 minutes */
 #define FLB_AZ_LI_TOKEN_TIMEOUT 3600
-/* Conservative service ceiling for both JSON and the selected HTTP body. */
-#define FLB_AZ_LI_MAX_BODY_BYTES 1000000
+/* Azure's 1 MiB limit applies to the completed outgoing HTTP body. */
+#define FLB_AZ_LI_MAX_BODY_BYTES 1048576
 /* Default collection target; the service ceiling remains fixed. */
 #define FLB_AZ_LI_DEFAULT_BATCH_TARGET_SIZE 800000
 
