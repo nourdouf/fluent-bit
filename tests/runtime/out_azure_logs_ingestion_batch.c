@@ -177,7 +177,7 @@ static void check_combined_allocation_retry(int compress)
     output_id = flb_output(engine, "azure_logs_ingestion", NULL);
     TEST_ASSERT(output_id >= 0);
     TEST_ASSERT(flb_output_set(engine, output_id, "match", "chunk.*", "workers", "0",
-                              "batch_wait_ms", "1500", "retry_limit", "1",
+                              "batch", "on", "batch_wait_ms", "1500", "retry_limit", "1",
                               "compress", compress ? "on" : "off",
                               "client_id", "suite", "client_secret", "suite",
                               "tenant_id", "suite", "dcr_id", "suite", "table_name", "suite_CL",
