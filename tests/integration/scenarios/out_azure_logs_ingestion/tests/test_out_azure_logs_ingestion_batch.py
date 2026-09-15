@@ -46,11 +46,20 @@ def batch_service(tmp_path, count=3, wait_ms=5000, chunk_bytes=None):
 
 
 def metrics(service):
-    response = requests.get(
-        f"http://127.0.0.1:{service.flb.http_monitoring_port}/api/v1/metrics", timeout=2
-    )
-    response.raise_for_status()
-    return response.json()["output"]["azure_logs_ingestion.0"]
+    def snapshot():
+        response = requests.get(
+            f"http://127.0.0.1:{service.flb.http_monitoring_port}/api/v1/metrics", timeout=2
+        )
+        if response.status_code == 404:
+            # A reader can outlive a rejected snapshot replacement, leaving the
+            # endpoint unavailable until the next export, even after startup.
+            logging.getLogger(__name__).info("metrics snapshot unavailable (HTTP 404)")
+            return None
+        response.raise_for_status()
+        return response.json()["output"]["azure_logs_ingestion.0"]
+
+    return service.service.wait_for_condition(
+        snapshot, timeout=10, interval=0.05, description="available output metrics snapshot")
 
 
 def stop_checked(service):
