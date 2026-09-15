@@ -649,19 +649,36 @@ def test_full_listen_queue_bounds_connect_without_accept(tmp_path, stage):
 
 @pytest.mark.parametrize("stage", ["oauth", "ingestion"])
 @pytest.mark.parametrize("batching,workers", [(True, 0), (False, 0), (False, 1)])
-def test_stalled_response_uses_native_io_idle_timeout(tmp_path, stage, batching, workers):
+def test_stalled_response_uses_native_io_idle_timeout(tmp_path, monkeypatch, stage,
+                                                    batching, workers):
     service, port = timeout_service(tmp_path)
     set_execution_mode(service, batching, workers)
     set_output(service, **{"net.io_timeout": "1s"})
     configure = (http_server.configure_oauth_token_response if stage == "oauth"
                  else http_server.configure_http_response)
+    received_at = []
+    target_path = "/oauth/token" if stage == "oauth" else "/dataCollectionRules/"
+    original = http_server._record_request
+
+    def record_request():
+        original()
+        if http_server.request.path.startswith(target_path):
+            received_at.append(time.monotonic())
+
+    monkeypatch.setattr(http_server, "_record_request", record_request)
     try:
         service.start()
         configure(hang_before_response=True)
-        started = time.monotonic()
         submit(port, 0)
+        # Observe the response stall separately from dispatch, OAuth and TLS setup.
+        wait(service, lambda: received_at, "stalled request received")
+        started = received_at[0]
         wait(service, lambda: dropped_callbacks(service, 1), "native idle timeout", timeout=4)
-        assert time.monotonic() - started < 4
+        elapsed = time.monotonic() - started
+        logging.getLogger(__name__).info(
+            "idle timeout stage=%s batching=%s workers=%s received_at=%.6f elapsed=%.3fs",
+            stage, batching, workers, started, elapsed)
+        assert elapsed < 4
         assert metrics(service)["proc_records"] == 0
         assert request_metric(service, RESPONSES, name="azure_logs_ingestion.0",
                               dcr_id="dcr-suite", status="200") == 0
