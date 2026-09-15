@@ -881,12 +881,19 @@ def test_partial_batch_uses_first_member_deadline(tmp_path, monkeypatch, count):
         log = Path(service.flb.log_file).read_text()
         tasks = re.findall(r"\[([0-9/]+ [0-9:.]+)\].*\[task\] created task=.* id=(\d+) OK", log)
         assert len(tasks) == count, log
-        first = datetime.datetime.strptime(tasks[0][0], "%Y/%m/%d %H:%M:%S.%f").timestamp()
-        elapsed = item["time"] - first
-        logging.getLogger(__name__).info("partial count=%s first-member elapsed=%.3fs tasks=%s",
-                                         count, elapsed, tasks)
-        # Later source arrives two seconds later. Refreshing the deadline would take ~6s.
-        assert 3.8 <= elapsed < 5.5
+        opened = re.findall(r"batch created: now=(\d+) deadline=(\d+)", log)
+        closed = re.findall(r"batch closed: deadline=(\d+) now=(\d+) chunks=(\d+)", log)
+        assert len(opened) == len(closed) == 1, log
+        created_at, first_deadline = map(int, opened[0])
+        deadline, closed_at, chunks = map(int, closed[0])
+        logging.getLogger(__name__).info(
+            "partial count=%s first_deadline=%s closed_deadline=%s closed_at=%s chunks=%s",
+            count, first_deadline, deadline, closed_at, chunks)
+        # Later admission must not restart collection; OAuth/TLS follow its closure.
+        assert first_deadline - created_at == 4000
+        assert deadline == first_deadline
+        assert 0 <= closed_at - first_deadline < 1500
+        assert chunks == count
         assert metrics(service)["proc_records"] == 0
         item["gate"].set()
         service.service.wait_for_condition(
