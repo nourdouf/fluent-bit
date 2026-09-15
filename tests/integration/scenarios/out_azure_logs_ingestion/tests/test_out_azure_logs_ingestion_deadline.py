@@ -696,5 +696,5 @@ def set_execution_mode(service, batching, workers):
     output = config["pipeline"]["outputs"][0]
     output["workers"] = workers
     if not batching:
-        del output["batch_wait_ms"]
+        output["batch"] = False
     path.write_text(yaml.safe_dump(config))

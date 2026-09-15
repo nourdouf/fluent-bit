@@ -40,7 +40,7 @@ def batch_service(tmp_path, count=3, wait_ms=5000, chunk_bytes=None):
         for i, source in enumerate(config["pipeline"]["inputs"]):
             source["dummy"] = json.dumps(sized_record(i, field_size=chunk_bytes // (10 * (i + 1))))
     config["pipeline"]["outputs"][0].update(
-        {"match": "chunk.*", "workers": 0, "batch_wait_ms": wait_ms}
+        {"match": "chunk.*", "workers": 0, "batch": True, "batch_wait_ms": wait_ms}
     )
     config_path = tmp_path / "batch.yaml"
     config_path.write_text(yaml.safe_dump(config))
@@ -142,7 +142,7 @@ def test_pending_batches_drain_on_lifecycle_transition(tmp_path, monkeypatch, pe
     config["pipeline"]["outputs"][0].update(
         {"time_generated": True, "compress": "off", "batch_target_size": 1000000})
     if not batching:
-        del config["pipeline"]["outputs"][0]["batch_wait_ms"]
+        config["pipeline"]["outputs"][0]["batch"] = False
     # Leave hot_reload.ensure_thread_safety at its default (on).
     config["pipeline"]["inputs"] = [{"name": "http", "listen": "127.0.0.1", "port": port}]
     path.write_text(yaml.safe_dump(config))
@@ -355,6 +355,54 @@ def exact_size_record(chunk_id, array_bytes):
         record[f"field_{i}"] = "x" * length
         remaining -= length
     return record
+
+
+@pytest.mark.parametrize("enabled,wait_ms,workers", [
+    pytest.param(None, None, 0, id="disabled-by-default"),
+    pytest.param(None, 100, 0, id="wait-does-not-enable"),
+    pytest.param(False, 100, 1, id="explicitly-disabled-with-worker"),
+    pytest.param(True, None, 0, id="enabled-default-wait"),
+    pytest.param(True, 50, 0, id="enabled-custom-wait"),
+])
+def test_batch_enable_switch(tmp_path, monkeypatch, enabled, wait_ms, workers):
+    service = batch_service(tmp_path)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    output = config["pipeline"]["outputs"][0]
+    output["workers"] = workers
+    if enabled is None:
+        del output["batch"]
+    else:
+        output["batch"] = enabled
+    if wait_ms is None:
+        del output["batch_wait_ms"]
+    else:
+        output["batch_wait_ms"] = wait_ms
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    try:
+        service.start()
+        expected_requests = 1 if enabled else 3
+        gates.wait(service, expected_requests)
+        assert len(gates.requests) == expected_requests
+        assert metrics(service)["proc_records"] == 0
+        opened = re.findall(r"batch created: now=(\d+) deadline=(\d+)",
+                            Path(service.flb.log_file).read_text())
+        if enabled:
+            assert len(opened) == 1
+            created, deadline = map(int, opened[0])
+            assert deadline - created == (1000 if wait_ms is None else wait_ms)
+        else:
+            assert not opened
+        gates.release_all()
+        service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 6,
+                                           timeout=10, description="all switch-test records delivered")
+        assert collections.Counter(r["chunk_id"] for item in gates.requests
+                                   for r in item["records"]) == {0: 1, 1: 2, 2: 3}
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
 
 
 def entropy_record(chunk_id, array_bytes, random_fraction=1.0):
@@ -574,7 +622,7 @@ def test_normalized_batch_target_preserves_delivery(tmp_path, monkeypatch, compr
     # Both therefore use 800000, without enabling batching on their own.
     output.update({"time_generated": True, "compress": compress, "batch_target_size": target})
     if not batched:
-        del output["batch_wait_ms"]
+        output["batch"] = False
     path.write_text(yaml.safe_dump(config))
     sizes = [900001] if batched else [300001, 300001, 300001]
     gates = Gates(monkeypatch, max_bytes=1000000)
@@ -751,6 +799,7 @@ def test_target_without_wait_remains_unbatched(tmp_path, monkeypatch, compress, 
     for chunk_id, source in enumerate(config["pipeline"]["inputs"]):
         source.update({"dummy": json.dumps(expected[chunk_id]), "copies": 1})
     output = config["pipeline"]["outputs"][0]
+    del output["batch"]
     del output["batch_wait_ms"]
     output.update({"time_generated": True, "compress": compress,
                    "batch_target_size": 600000, "workers": workers})
@@ -1058,9 +1107,11 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     {"batch_wait_ms": -1},
     {"batch_wait_ms": "999999999999999999999"},
     {"batch_wait_ms": "1000junk"},
-    pytest.param({"batch_wait_ms": 1000, "workers": -1}, id="negative-workers"),
-    {"batch_wait_ms": 1000, "workers": 1},
-    {"batch_wait_ms": 1000, "workers": 2},
+    pytest.param({"batch": True, "batch_wait_ms": 1000, "workers": -1}, id="negative-workers"),
+    {"batch": True, "batch_wait_ms": 1000, "workers": 1},
+    {"batch": True, "batch_wait_ms": 1000, "workers": 2},
+    pytest.param({"batch": True, "workers": 1}, id="enabled-with-worker"),
+    pytest.param({"batch": True, "batch_wait_ms": 0}, id="enabled-zero-wait"),
     {"batch_wait_ms": 1000, "http_timeout": 5},
     {"http.response_timeout": "5s"},
     {"batch_wait_ms": 1000, "http.response_timeout": "5s"},
@@ -1070,7 +1121,7 @@ def test_shared_failure_uses_finite_engine_retries(tmp_path, monkeypatch, status
     for target, label in [(" ", "blank"), (0, "zero"), (-1, "negative"),
                           (1048577, "above-ceiling"), ("999999999999999999999", "overflow"),
                           ("800000junk", "junk"), ("800K", "suffix"), ("800000.5", "fraction")]
-    for wait_options, mode in [({}, "unbatched"), ({"batch_wait_ms": 1000}, "batched")]
+    for wait_options, mode in [({}, "unbatched"), ({"batch": True, "batch_wait_ms": 1000}, "batched")]
 ])
 def test_batch_configuration_rejected_before_suspension(tmp_path, options):
     import subprocess
@@ -1107,8 +1158,10 @@ def test_batch_configuration_rejected_before_suspension(tmp_path, options):
         assert "unable to add variant value property" in report
     elif "batch_target_size" in options:
         assert "batch_target_size must be an integer from 1 to 1048576 bytes" in report
+    elif options.get("batch") and options.get("workers", 0) != 0:
+        assert "batching requires workers=0" in report
     else:
-        assert "batching requires positive batch_wait_ms and workers=0" in report
+        assert "batch_wait_ms must be a positive integer" in report
     if leaks_enabled():
         # Leaks reports its own status, independently of the expected startup rejection.
         assert result.returncode == 0, report
@@ -1141,7 +1194,7 @@ def test_idle_batching_does_not_add_scheduler_timers(tmp_path):
         config["pipeline"]["inputs"][0]["interval_sec"] = 3600
         if not enabled:
             output = config["pipeline"]["outputs"][0]
-            del output["batch_wait_ms"]
+            output["batch"] = False
         path.write_text(yaml.safe_dump(config))
         try:
             service.start()
@@ -1230,7 +1283,7 @@ def test_request_metrics_count_attempt_not_participants(tmp_path, monkeypatch, c
     output = config["pipeline"]["outputs"][0]
     output["retry_limit"] = 1
     if chunk_count == 1:
-        del output["batch_wait_ms"]
+        output["batch"] = False
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch)
     labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite"}

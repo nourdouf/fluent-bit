@@ -32,7 +32,7 @@ def test_auth_waiters_resume_after_refresh(tmp_path, monkeypatch, batching, comp
     output.update({"compress": compress, "time_generated": False,
                    "batch_target_size": 1, "retry_limit": 1})
     if not batching:
-        del output["batch_wait_ms"]
+        output["batch"] = False
     config["pipeline"]["outputs"].append({"name": "null", "match": "barrier", "workers": 0})
     path.write_text(yaml.safe_dump(config))
     gates = Gates(monkeypatch, gate_timeout=120)
