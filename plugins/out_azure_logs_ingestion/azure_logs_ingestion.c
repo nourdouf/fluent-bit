@@ -632,6 +632,8 @@ static void az_li_batch_close(struct flb_az_li *ctx)
     sender = mk_list_entry_first(&ctx->collecting->members, struct az_li_member, member_link);
     ctx->collecting = NULL;
     sender->send = FLB_TRUE;
+    flb_plg_debug(ctx->ins, "batch closed: deadline=%" PRIu64 " now=%" PRIu64 " chunks=%i",
+                  sender->batch->deadline, az_li_now_ms(), sender->batch->count);
     if (!mk_list_entry_is_orphan(&sender->parked_link)) {
         mk_list_del(&sender->parked_link);
         mk_list_add(&sender->parked_link, &ctx->batch_ready);
@@ -837,6 +839,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     flb_sds_t payload = NULL;
     struct az_li_body body = {0};
     size_t size;
+    uint64_t created_at = 0;
     int result;
 
     if (ctx->batch_wait_ms == 0) {
@@ -871,7 +874,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         }
         mk_list_init(&replacement->members);
         replacement->json_size = 2;
-        replacement->deadline = az_li_now_ms() + ctx->batch_wait_ms;
+        created_at = az_li_now_ms();
+        replacement->deadline = created_at + ctx->batch_wait_ms;
     }
 
     /* Only callbacks parked by the plugin need polling; idle outputs need no timer. */
@@ -890,6 +894,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         }
         batch = replacement;
         ctx->collecting = batch;
+        flb_plg_debug(ctx->ins, "batch created: now=%" PRIu64 " deadline=%" PRIu64,
+                      created_at, batch->deadline);
         if (ctx->compress_enabled) {
             batch->gzip = az_li_gzip_stream_create();
             if (!batch->gzip ||
