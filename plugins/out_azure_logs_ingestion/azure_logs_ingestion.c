@@ -86,13 +86,19 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     mk_list_init(&ctx->auth_waiters);
     ctx->continuation_channel[0] = -1;
     ctx->continuation_channel[1] = -1;
+    ctx->batch_wait_ms = FLB_AZ_LI_DEFAULT_BATCH_WAIT_MS;
     if (flb_output_get_property("batch_wait_ms", ins)) {
         if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
-                                  &ctx->batch_wait_ms) != 0 || ins->tp_workers != 0) {
-            flb_plg_error(ins, "batching requires positive batch_wait_ms and workers=0");
+                                  &ctx->batch_wait_ms) != 0) {
+            flb_plg_error(ins, "batch_wait_ms must be a positive integer");
             flb_az_li_ctx_destroy(ctx);
             return -1;
         }
+    }
+    if (ctx->batch_enabled && ins->tp_workers != 0) {
+        flb_plg_error(ins, "batching requires workers=0");
+        flb_az_li_ctx_destroy(ctx);
+        return -1;
     }
     ctx->batch_target_size = FLB_AZ_LI_DEFAULT_BATCH_TARGET_SIZE;
     if (flb_output_get_property("batch_target_size", ins)) {
@@ -903,7 +909,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     uint64_t created_at = 0;
     int result;
 
-    if (ctx->batch_wait_ms == 0) {
+    if (!ctx->batch_enabled) {
         if (az_li_format(event_chunk->data, event_chunk->size, &payload, &size,
                          ctx, config) != 0) {
             FLB_OUTPUT_RETURN(FLB_ERROR);
@@ -1066,11 +1072,15 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_az_li, table_name),
      "The name of the custom log table, including '_CL' suffix"
     },
-    /* Omission preserves single-chunk flushes. */
     {
-     FLB_CONFIG_MAP_STR, "batch_wait_ms", NULL,
+     FLB_CONFIG_MAP_BOOL, "batch", "false",
+     0, FLB_TRUE, offsetof(struct flb_az_li, batch_enabled),
+     "Enable whole-chunk batching; requires workers=0."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "batch_wait_ms", "1000",
      0, FLB_FALSE, 0,
-     "Positive collection wait in milliseconds from the first chunk; requires workers=0."
+     "Positive collection wait in milliseconds from the first chunk when batch=true."
     },
     {
      FLB_CONFIG_MAP_STR, "batch_target_size", "800000",
@@ -1078,7 +1088,7 @@ static struct flb_config_map config_map[] = {
      "Soft outgoing-body target in bytes, from 1 to 1048576 without size suffixes. "
      "Close after whole-chunk admission when emitted gzip bytes, or plain JSON bytes, reach the target. "
      "Rebuild oversized aggregates at whole-chunk boundaries to fit the 1048576-byte wire limit. "
-     "Does not enable batching without batch_wait_ms."
+     "Does not enable batching without batch=true."
     },
     /* optional params */
     {
