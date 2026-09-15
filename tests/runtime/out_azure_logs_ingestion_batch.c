@@ -279,7 +279,7 @@ static void check_auth_dispatch(int hold_refresh, int mixed)
     TEST_ASSERT(evl != NULL);
     mk_list_init(&ctx.batch_ready);
     mk_list_init(&ctx.auth_waiters);
-    MK_EVENT_INIT(&ctx.continuation_event, -1, &ctx, az_li_dispatch);
+    MK_EVENT_INIT(&ctx.continuation_event, -1, NULL, az_li_dispatch);
     TEST_ASSERT(mk_event_channel_create(evl, &ctx.continuation_channel[0],
                                        &ctx.continuation_channel[1],
                                        &ctx.continuation_event) == 0);
