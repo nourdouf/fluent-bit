@@ -107,7 +107,7 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     /* Both batched and unbatched main-thread flushes can wait behind OAuth.
      * Legacy workers retain synchronous OAuth and mutex-protected token access. */
     if (ins->tp_workers == 0) {
-        MK_EVENT_INIT(&ctx->continuation_event, -1, ctx, az_li_dispatch);
+        MK_EVENT_INIT(&ctx->continuation_event, -1, NULL, az_li_dispatch);
         if (mk_event_channel_create(config->evl, &ctx->continuation_channel[0],
                                      &ctx->continuation_channel[1],
                                      &ctx->continuation_event) != 0) {
@@ -657,7 +657,9 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
 static int az_li_dispatch(void *data)
 {
     struct mk_event *event = data;
-    struct flb_az_li *ctx = event->data;
+    /* Backends can own event->data; the embedded event identifies this output. */
+    struct flb_az_li *ctx = (struct flb_az_li *)
+                          ((char *) event - offsetof(struct flb_az_li, continuation_event));
     struct az_li_member *member;
     struct az_li_auth_waiter *waiter;
     struct flb_coro *coro;
