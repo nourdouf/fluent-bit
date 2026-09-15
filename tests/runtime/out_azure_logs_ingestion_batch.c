@@ -26,6 +26,7 @@
 #include "flb_tests_runtime.h"
 #include "../../plugins/out_azure_logs_ingestion/azure_logs_ingestion_gzip.h"
 
+static void *fail_remainder_allocation(size_t count, size_t size, const char *caller);
 static flb_sds_t fail_combined_allocation(size_t size, const char *caller);
 static int fail_gzip_finish(struct az_li_gzip_stream *stream, void **data, size_t *size);
 
@@ -33,11 +34,13 @@ static int fail_gzip_finish(struct az_li_gzip_stream *stream, void **data, size_
  * option or a process-wide allocator failure. The engine and FLB_OUTPUT_RETURN
  * remain unchanged. Include the declarations before substituting calls. */
 #define out_azure_logs_ingestion_plugin test_azure_logs_ingestion_plugin
+#define flb_calloc(count, size) fail_remainder_allocation(count, size, __func__)
 #define flb_sds_create_size(size) fail_combined_allocation(size, __func__)
 #define az_li_gzip_stream_finish fail_gzip_finish
 #include "../../plugins/out_azure_logs_ingestion/azure_logs_ingestion.c"
 #undef az_li_gzip_stream_finish
 #undef flb_sds_create_size
+#undef flb_calloc
 #undef out_azure_logs_ingestion_plugin
 
 struct observed_chunk {
@@ -55,6 +58,15 @@ static int inject_allocation_failure;
 static int gzip_failures;
 static int inject_gzip_failure;
 static int observation_errors;
+static int inject_remainder_failure;
+
+static void *fail_remainder_allocation(size_t count, size_t size, const char *caller)
+{
+    if (inject_remainder_failure && strcmp(caller, "az_li_batch_prepare_bounded") == 0) {
+        return NULL;
+    }
+    return flb_calloc(count, size);
+}
 
 static flb_sds_t fail_combined_allocation(size_t size, const char *caller)
 {
@@ -372,7 +384,152 @@ static void test_auth_dispatch_withholds_refresh_owner(void)
     check_auth_dispatch(FLB_TRUE, FLB_TRUE);
 }
 
+static void check_finalization_overflow(int empty_members, int allocation_failure)
+{
+    struct flb_output_instance output = {0};
+    struct flb_az_li ctx = {0};
+    struct az_li_batch batch = {0};
+    struct az_li_batch *remainder;
+    struct az_li_member members[6] = {0};
+    struct az_li_member *sender;
+    struct az_li_body body = {0};
+    char *random_data;
+    void *decoded;
+    size_t decoded_size;
+    size_t size;
+    size_t index;
+    size_t emitted;
+    uint32_t random = 1;
+    int member_index;
+    int found = FLB_FALSE;
+
+    output.p = &test_azure_logs_ingestion_plugin;
+    output.log_level = FLB_LOG_INFO;
+    snprintf(output.name, sizeof(output.name), "azure_logs_ingestion.0");
+    ctx.ins = &output;
+    ctx.compress_enabled = FLB_TRUE;
+    ctx.notification_pending = FLB_TRUE;
+    mk_list_init(&ctx.parked);
+    mk_list_init(&ctx.batch_ready);
+    mk_list_init(&ctx.auth_waiters);
+    mk_list_init(&batch.members);
+    batch.count = 3 + empty_members;
+    batch.references = batch.count;
+    random_data = flb_malloc(470000);
+    TEST_ASSERT(random_data != NULL);
+    for (index = 0; index < 470000; index++) {
+        random = random * 1664525 + 1013904223;
+        random_data[index] = 35 + ((random >> 16) % 88);
+        if (random_data[index] == '\\') {
+            random_data[index] = '!';
+        }
+    }
+    for (member_index = 0; member_index < batch.count; member_index++) {
+        members[member_index].batch = &batch;
+        mk_list_add(&members[member_index].member_link, &batch.members);
+        if (member_index != 0) {
+            mk_list_add(&members[member_index].parked_link, &ctx.parked);
+        }
+    }
+    /* Find a real miniz pending-output boundary, rather than fabricate a size
+     * or assume that emitted bytes include the last compressed block. */
+    for (size = 400000; size <= 470000; size += 2048) {
+        for (member_index = 0; member_index < batch.count; member_index++) {
+            if (member_index >= 3) {
+                members[member_index].formatted = flb_sds_create("[]");
+                TEST_ASSERT(members[member_index].formatted != NULL);
+                continue;
+            }
+            members[member_index].formatted = flb_sds_create_size(size + 4);
+            TEST_ASSERT(members[member_index].formatted != NULL);
+            memcpy(members[member_index].formatted, "[\"", 2);
+            memcpy(members[member_index].formatted + 2, random_data, size);
+            memcpy(members[member_index].formatted + size + 2, "\"]", 2);
+            flb_sds_len_set(members[member_index].formatted, size + 4);
+        }
+        az_li_batch_rebuild(&ctx, &batch);
+        emitted = batch.emitted_size;
+        TEST_ASSERT(az_li_batch_prepare(&ctx, &batch, &body) == 0);
+        found = emitted < FLB_AZ_LI_MAX_BODY_BYTES && body.size > FLB_AZ_LI_MAX_BODY_BYTES;
+        flb_free(body.data);
+        memset(&body, 0, sizeof(body));
+        if (found) {
+            break;
+        }
+        az_li_batch_release_json(&batch);
+    }
+    TEST_ASSERT(found);
+    az_li_batch_rebuild(&ctx, &batch);
+    TEST_CHECK(batch.emitted_size < FLB_AZ_LI_MAX_BODY_BYTES);
+    if (allocation_failure) {
+        inject_remainder_failure = FLB_TRUE;
+        TEST_CHECK(az_li_batch_prepare_bounded(&ctx, &batch, &body) == -1);
+        inject_remainder_failure = FLB_FALSE;
+        TEST_CHECK(body.data == NULL);
+        TEST_CHECK(batch.count == 3);
+        TEST_CHECK(batch.references == 3);
+        TEST_CHECK(mk_list_size(&ctx.batch_ready) == 0);
+        for (member_index = 0; member_index < 3; member_index++) {
+            TEST_CHECK(members[member_index].batch == &batch);
+            TEST_CHECK(members[member_index].formatted != NULL);
+        }
+        az_li_batch_release_json(&batch);
+        flb_free(random_data);
+        return;
+    }
+    TEST_ASSERT(az_li_batch_prepare_bounded(&ctx, &batch, &body) == 0);
+    TEST_CHECK(body.compressed == FLB_TRUE);
+    TEST_CHECK(body.size <= FLB_AZ_LI_MAX_BODY_BYTES);
+    TEST_CHECK(batch.count == 2);
+    TEST_CHECK(batch.references == 2);
+    TEST_CHECK(members[0].batch == &batch);
+    TEST_CHECK(members[1].batch == &batch);
+    remainder = members[2].batch;
+    TEST_ASSERT(remainder != &batch);
+    TEST_CHECK(remainder->count == 1 + empty_members);
+    TEST_CHECK(remainder->references == 1 + empty_members);
+    sender = mk_list_entry_first(&ctx.batch_ready, struct az_li_member, parked_link);
+    TEST_CHECK(sender == &members[2]);
+    TEST_CHECK(sender->send == FLB_TRUE);
+    TEST_ASSERT(flb_gzip_uncompress(body.data, body.size, &decoded, &decoded_size) == 0);
+    TEST_CHECK(decoded_size == 2 * size + 7);
+    TEST_CHECK(memcmp((char *) decoded + 2, random_data, size) == 0);
+    TEST_CHECK(memcmp((char *) decoded + size + 5, random_data, size) == 0);
+    flb_free(decoded);
+    flb_free(body.data);
+    az_li_batch_release_json(&batch);
+    memset(&body, 0, sizeof(body));
+    TEST_ASSERT(az_li_batch_prepare_bounded(&ctx, remainder, &body) == 0);
+    TEST_CHECK(body.size <= FLB_AZ_LI_MAX_BODY_BYTES);
+    TEST_ASSERT(flb_gzip_uncompress(body.data, body.size, &decoded, &decoded_size) == 0);
+    TEST_CHECK(decoded_size == size + 4);
+    TEST_CHECK(memcmp((char *) decoded + 2, random_data, size) == 0);
+    flb_free(decoded);
+    flb_free(body.data);
+    az_li_batch_release_json(remainder);
+    flb_free(remainder);
+    flb_free(random_data);
+}
+
+static void test_finalization_overflow_rebuilds_whole_chunks(void)
+{
+    check_finalization_overflow(0, FLB_FALSE);
+}
+
+static void test_finalization_overflow_retains_empty_members(void)
+{
+    check_finalization_overflow(3, FLB_FALSE);
+}
+
+static void test_overflow_allocation_failure_preserves_members(void)
+{
+    check_finalization_overflow(0, FLB_TRUE);
+}
+
 TEST_LIST = {
+    {"overflow_allocation_failure_preserves_members", test_overflow_allocation_failure_preserves_members},
+    {"finalization_overflow_rebuilds_whole_chunks", test_finalization_overflow_rebuilds_whole_chunks},
+    {"finalization_overflow_retains_empty_members", test_finalization_overflow_retains_empty_members},
     {"auth_dispatch_without_batches", test_auth_dispatch_without_batches},
     {"auth_dispatch_fair_bounded_continuation", test_auth_dispatch_fair_bounded_continuation},
     {"auth_dispatch_withholds_refresh_owner", test_auth_dispatch_withholds_refresh_owner},
