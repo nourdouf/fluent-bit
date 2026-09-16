@@ -482,6 +482,14 @@ def test_overflow_rebuild_preserves_independent_chunk_outcomes(tmp_path, monkeyp
         gates.wait(service, 2)
         assert len(gates.requests) == 2
         assert metrics(service)["proc_records"] == 0
+        rebuild_metric = "fluentbit_azure_logs_ingestion_batch_rebuild_duration_seconds"
+        rebuild_labels = {"name": "azure_logs_ingestion.0"}
+        service.service.wait_for_condition(
+            lambda: request_metric(service, rebuild_metric + "_count", **rebuild_labels) == 1,
+            timeout=10, description="one overflow recovery observed before HTTP completion")
+        rebuild_duration = request_metric(service, rebuild_metric + "_sum", **rebuild_labels)
+        assert rebuild_duration > 0
+        assert request_metric(service, rebuild_metric + "_bucket", le="+Inf", **rebuild_labels) == 1
         by_id = {item["records"][0]["chunk_id"]: item for item in gates.requests}
         assert set(by_id) == {0, 1}
         by_id[1]["gate"].set()
@@ -500,6 +508,8 @@ def test_overflow_rebuild_preserves_independent_chunk_outcomes(tmp_path, monkeyp
         assert_payload_reason(service, gates.requests[:2], "target_size_reached")
         if failed_status:
             assert_payload_reason(service, gates.requests[2:], "timeout")
+        assert request_metric(service, rebuild_metric + "_count", **rebuild_labels) == 1
+        assert request_metric(service, rebuild_metric + "_sum", **rebuild_labels) == rebuild_duration
         for item in gates.requests:
             assert len(item["records"]) == 1
             assert item["raw_size"] <= WIRE_LIMIT
