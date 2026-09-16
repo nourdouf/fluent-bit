@@ -254,6 +254,9 @@ endif()
 
 # Output Plugins
 FLB_RT_TEST(FLB_OUT_AZURE_LOGS_INGESTION "out_azure_logs_ingestion_gzip.c")
+if(FLB_OUT_AZURE_LOGS_INGESTION AND FLB_METRICS)
+  FLB_RT_TEST(FLB_OUT_AZURE_LOGS_INGESTION "out_azure_logs_ingestion_metrics.c")
+endif()
 if(FLB_OUT_AZURE_LOGS_INGESTION AND FLB_IN_DUMMY AND FLB_METRICS)
   FLB_RT_TEST(FLB_OUT_AZURE_LOGS_INGESTION "out_azure_logs_ingestion_batch.c")
 endif()
