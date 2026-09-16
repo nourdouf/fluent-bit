@@ -253,6 +253,42 @@ static int az_li_format(const void *in_buf, size_t in_bytes,
     return 0;
 }
 
+/* Owns a formatted JSON array and provides a zero-copy view of its elements. */
+struct az_li_elements {
+    /* Owns the complete formatted JSON array. */
+    flb_sds_t storage;
+    /* Non-owning view of the bytes between the array brackets. */
+    char *data;
+    size_t size;
+};
+
+static int az_li_format_elements(const void *in_buf, size_t in_bytes,
+                                 struct az_li_elements *elements,
+                                 struct flb_az_li *ctx,
+                                 struct flb_config *config)
+{
+    size_t size;
+
+    memset(elements, 0, sizeof(*elements));
+    if (az_li_format(in_buf, in_bytes, &elements->storage, &size, ctx, config) != 0) {
+        return -1;
+    }
+    if (size < 2 || elements->storage[0] != '[' || elements->storage[size - 1] != ']') {
+        flb_sds_destroy(elements->storage);
+        elements->storage = NULL;
+        return -1;
+    }
+    elements->data = elements->storage + 1;
+    elements->size = size - 2;
+    return 0;
+}
+
+static void az_li_elements_destroy(struct az_li_elements *elements)
+{
+    flb_sds_destroy(elements->storage);
+    memset(elements, 0, sizeof(*elements));
+}
+
 /* Only refresh waiters are resumed here; network I/O resumes in the engine. */
 struct az_li_auth_waiter {
     struct flb_coro *coro;
@@ -647,7 +683,8 @@ struct az_li_member {
     struct mk_list parked_link;
     struct az_li_batch *batch;
     struct flb_coro *coro;
-    flb_sds_t formatted;
+    /* Owns the formatted JSON array and exposes its elements, minus the surrounding brackets, to the batch. */
+    struct az_li_elements formatted_elements;
     int comma;
     int send;
 };
@@ -779,22 +816,21 @@ static void az_li_batch_plain(struct flb_az_li *ctx, struct az_li_batch *batch)
 }
 
 static void az_li_batch_append(struct flb_az_li *ctx, struct az_li_batch *batch,
-                                struct az_li_member *member, size_t size)
+                               struct az_li_member *member)
 {
-    size_t interior = size - 2;
-
     /* One owner of separator and empty-array rules for streaming and fallback.
      * No yield is allowed between membership admission and consuming these bytes.
      * json_size always includes both brackets, even before gzip receives ']'. */
-    if (interior == 0) {
+    if (member->formatted_elements.size == 0) {
         return;
     }
     member->comma = batch->json_size > 2;
-    batch->json_size += interior + member->comma;
+    batch->json_size += member->formatted_elements.size + member->comma;
     if (batch->gzip &&
         ((member->comma && az_li_gzip_stream_append(batch->gzip, ",", 1,
                                                     &batch->emitted_size) != 0) ||
-         az_li_gzip_stream_append(batch->gzip, member->formatted + 1, interior,
+         az_li_gzip_stream_append(batch->gzip, member->formatted_elements.data,
+                                  member->formatted_elements.size,
                                   &batch->emitted_size) != 0)) {
         az_li_batch_plain(ctx, batch);
     }
@@ -804,11 +840,9 @@ static void az_li_batch_release_json(struct az_li_batch *batch)
 {
     struct mk_list *head;
     struct az_li_member *member;
-
     mk_list_foreach(head, &batch->members) {
         member = mk_list_entry(head, struct az_li_member, member_link);
-        flb_sds_destroy(member->formatted);
-        member->formatted = NULL;
+        az_li_elements_destroy(&member->formatted_elements);
     }
 }
 
@@ -817,7 +851,6 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     struct mk_list *head;
     struct az_li_member *member;
     flb_sds_t combined = NULL;
-    size_t interior;
     size_t total = batch->json_size;
     size_t offset = 1;
 
@@ -833,13 +866,13 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     combined[0] = '[';
     mk_list_foreach(head, &batch->members) {
         member = mk_list_entry(head, struct az_li_member, member_link);
-        interior = flb_sds_len(member->formatted) - 2;
-        if (interior > 0) {
+        if (member->formatted_elements.size > 0) {
             if (member->comma) {
                 combined[offset++] = ',';
             }
-            memcpy(combined + offset, member->formatted + 1, interior);
-            offset += interior;
+            memcpy(combined + offset, member->formatted_elements.data,
+                   member->formatted_elements.size);
+            offset += member->formatted_elements.size;
         }
     }
     combined[offset++] = ']';
@@ -896,7 +929,7 @@ static void az_li_batch_rebuild(struct flb_az_li *ctx, struct az_li_batch *batch
     mk_list_foreach(head, &batch->members) {
         member = mk_list_entry(head, struct az_li_member, member_link);
         member->comma = 0;
-        az_li_batch_append(ctx, batch, member, flb_sds_len(member->formatted));
+        az_li_batch_append(ctx, batch, member);
     }
 }
 
@@ -1003,26 +1036,24 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(result);
     }
 
-    /* The callback owns its final array until admission; malformed chunks cannot
+    /* The callback owns its formatted storage until admission; malformed chunks cannot
      * poison an existing batch or leave a partially initialized member behind. */
-    if (az_li_format(event_chunk->data, event_chunk->size, &member.formatted, &size,
-                     ctx, config) != 0 || size < 2 || member.formatted[0] != '[' ||
-        member.formatted[size - 1] != ']') {
-        flb_sds_destroy(member.formatted);
+    if (az_li_format_elements(event_chunk->data, event_chunk->size,
+                              &member.formatted_elements, ctx, config) != 0) {
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
 
     batch = ctx->collecting;
     if (batch && (batch->count == INT_MAX ||
-                  (size > 2 && size - 2 > SIZE_MAX - batch->json_size -
-                                         (batch->json_size > 2)))) {
-        flb_sds_destroy(member.formatted);
+                  (member.formatted_elements.size > SIZE_MAX - batch->json_size -
+                                                    (batch->json_size > 2)))) {
+        az_li_elements_destroy(&member.formatted_elements);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
     if (!batch) {
         replacement = flb_calloc(1, sizeof(*replacement));
         if (!replacement) {
-            flb_sds_destroy(member.formatted);
+            az_li_elements_destroy(&member.formatted_elements);
             FLB_OUTPUT_RETURN(FLB_RETRY);
         }
         mk_list_init(&replacement->members);
@@ -1037,7 +1068,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
                                   10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
         flb_plg_error(ctx->ins, "cannot create batch timer");
         flb_free(replacement);
-        flb_sds_destroy(member.formatted);
+        az_li_elements_destroy(&member.formatted_elements);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
@@ -1062,7 +1093,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     mk_list_add(&member.member_link, &batch->members);
     batch->count++;
     batch->references++;
-    az_li_batch_append(ctx, batch, &member, size);
+    az_li_batch_append(ctx, batch, &member);
     if ((batch->gzip ? batch->emitted_size : batch->json_size) >= ctx->batch_target_size) {
         az_li_batch_close(ctx, AZ_LI_SEND_TARGET_SIZE_REACHED);
     }
