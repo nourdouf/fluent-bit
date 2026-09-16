@@ -438,16 +438,22 @@ static void check_finalization_overflow(int empty_members, int allocation_failur
     for (size = 400000; size <= 470000; size += 2048) {
         for (member_index = 0; member_index < batch.count; member_index++) {
             if (member_index >= 3) {
-                members[member_index].formatted = flb_sds_create("[]");
-                TEST_ASSERT(members[member_index].formatted != NULL);
+                members[member_index].formatted_elements.storage = flb_sds_create("[]");
+                TEST_ASSERT(members[member_index].formatted_elements.storage != NULL);
+                members[member_index].formatted_elements.data =
+                    members[member_index].formatted_elements.storage + 1;
                 continue;
             }
-            members[member_index].formatted = flb_sds_create_size(size + 4);
-            TEST_ASSERT(members[member_index].formatted != NULL);
-            memcpy(members[member_index].formatted, "[\"", 2);
-            memcpy(members[member_index].formatted + 2, random_data, size);
-            memcpy(members[member_index].formatted + size + 2, "\"]", 2);
-            flb_sds_len_set(members[member_index].formatted, size + 4);
+            members[member_index].formatted_elements.storage =
+                flb_sds_create_size(size + 4);
+            TEST_ASSERT(members[member_index].formatted_elements.storage != NULL);
+            memcpy(members[member_index].formatted_elements.storage, "[\"", 2);
+            memcpy(members[member_index].formatted_elements.storage + 2, random_data, size);
+            memcpy(members[member_index].formatted_elements.storage + size + 2, "\"]", 2);
+            flb_sds_len_set(members[member_index].formatted_elements.storage, size + 4);
+            members[member_index].formatted_elements.data =
+                members[member_index].formatted_elements.storage + 1;
+            members[member_index].formatted_elements.size = size + 2;
         }
         az_li_batch_rebuild(&ctx, &batch);
         emitted = batch.emitted_size;
@@ -473,7 +479,7 @@ static void check_finalization_overflow(int empty_members, int allocation_failur
         TEST_CHECK(mk_list_size(&ctx.batch_ready) == 0);
         for (member_index = 0; member_index < 3; member_index++) {
             TEST_CHECK(members[member_index].batch == &batch);
-            TEST_CHECK(members[member_index].formatted != NULL);
+            TEST_CHECK(members[member_index].formatted_elements.storage != NULL);
         }
         az_li_batch_release_json(&batch);
         flb_free(random_data);
@@ -572,13 +578,16 @@ static void check_rebuild_metrics(int count, size_t size, enum rebuild_test_fail
     batch.references = count;
     for (index = 0; index < count; index++) {
         members[index].batch = &batch;
-        members[index].formatted = flb_sds_create_size(size);
-        TEST_ASSERT(members[index].formatted != NULL);
-        memset(members[index].formatted, 'x', size);
-        memcpy(members[index].formatted, "[\"", 2);
-        memcpy(members[index].formatted + size - 2, "\"]", 2);
-        members[index].formatted[size] = '\0';
-        flb_sds_len_set(members[index].formatted, size);
+        members[index].formatted_elements.storage = flb_sds_create_size(size);
+        TEST_ASSERT(members[index].formatted_elements.storage != NULL);
+        memset(members[index].formatted_elements.storage, 'x', size);
+        memcpy(members[index].formatted_elements.storage, "[\"", 2);
+        memcpy(members[index].formatted_elements.storage + size - 2, "\"]", 2);
+        members[index].formatted_elements.storage[size] = '\0';
+        flb_sds_len_set(members[index].formatted_elements.storage, size);
+        members[index].formatted_elements.data =
+            members[index].formatted_elements.storage + 1;
+        members[index].formatted_elements.size = size - 2;
         mk_list_add(&members[index].member_link, &batch.members);
         if (index > 0) {
             mk_list_add(&members[index].parked_link, &ctx.parked);
