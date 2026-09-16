@@ -22,6 +22,8 @@
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_time.h>
 #include <cmetrics/cmt_counter.h>
+#include <cmetrics/cmt_map.h>
+#include <cmetrics/cmt_metric.h>
 
 #include "flb_tests_runtime.h"
 #include "../../plugins/out_azure_logs_ingestion/azure_logs_ingestion_gzip.h"
@@ -526,7 +528,143 @@ static void test_overflow_allocation_failure_preserves_members(void)
     check_finalization_overflow(0, FLB_TRUE);
 }
 
+enum rebuild_test_failure {
+    REBUILD_NO_FAILURE,
+    REBUILD_REMAINDER_FAILURE,
+    REBUILD_FORMAT_FAILURE,
+    REBUILD_METRIC_UNAVAILABLE
+};
+
+static void check_rebuild_metrics(int count, size_t size, enum rebuild_test_failure failure)
+{
+    struct flb_output_instance output = {0};
+    struct flb_az_li ctx = {0};
+    struct az_li_batch batch = {0};
+    struct az_li_member members[4] = {0};
+    struct az_li_batch *remainder;
+    struct az_li_body body = {0};
+    struct cmt_histogram *histogram;
+    struct cmt_metric *metric;
+    double started_at;
+    double finished_at;
+    uint64_t expected_count;
+    int index;
+    int ret;
+
+    output.p = &test_azure_logs_ingestion_plugin;
+    output.alias = "rebuilder";
+    output.cmt = cmt_create();
+    TEST_ASSERT(output.cmt != NULL);
+    histogram = cmt_histogram_create(output.cmt, "fluentbit", "azure_logs_ingestion",
+                                    "batch_rebuild_duration_seconds", "Recovery duration.",
+                                    NULL, 1, (char *[]) {"name"});
+    TEST_ASSERT(histogram != NULL);
+    ctx.ins = &output;
+    if (failure != REBUILD_METRIC_UNAVAILABLE) {
+        ctx.cmt_batch_rebuild_duration = histogram;
+    }
+    ctx.notification_pending = FLB_TRUE;
+    mk_list_init(&ctx.parked);
+    mk_list_init(&ctx.batch_ready);
+    mk_list_init(&ctx.auth_waiters);
+    mk_list_init(&batch.members);
+    batch.count = count;
+    batch.references = count;
+    for (index = 0; index < count; index++) {
+        members[index].batch = &batch;
+        members[index].formatted = flb_sds_create_size(size);
+        TEST_ASSERT(members[index].formatted != NULL);
+        memset(members[index].formatted, 'x', size);
+        memcpy(members[index].formatted, "[\"", 2);
+        memcpy(members[index].formatted + size - 2, "\"]", 2);
+        members[index].formatted[size] = '\0';
+        flb_sds_len_set(members[index].formatted, size);
+        mk_list_add(&members[index].member_link, &batch.members);
+        if (index > 0) {
+            mk_list_add(&members[index].parked_link, &ctx.parked);
+        }
+    }
+    az_li_batch_rebuild(&ctx, &batch);
+    inject_remainder_failure = failure == REBUILD_REMAINDER_FAILURE;
+    inject_allocation_failure = failure == REBUILD_FORMAT_FAILURE;
+    started_at = az_li_monotonic_seconds();
+    TEST_ASSERT(started_at >= 0.0);
+    ret = az_li_batch_prepare_bounded(&ctx, &batch, &body);
+    finished_at = az_li_monotonic_seconds();
+    inject_remainder_failure = FLB_FALSE;
+    inject_allocation_failure = FLB_FALSE;
+    TEST_CHECK(ret == ((failure == REBUILD_REMAINDER_FAILURE ||
+                       failure == REBUILD_FORMAT_FAILURE) ? -1 : 0));
+    expected_count = count == 4 && failure != REBUILD_FORMAT_FAILURE &&
+                     failure != REBUILD_METRIC_UNAVAILABLE ? 1 : 0;
+    metric = cmt_map_metric_get(&histogram->opts, histogram->map, 1,
+                                (char *[]) {"rebuilder"}, CMT_FALSE);
+    TEST_CHECK((metric ? cmt_metric_hist_get_count_value(metric) : 0) == expected_count);
+    if (expected_count) {
+        TEST_ASSERT(metric != NULL);
+        TEST_CHECK(cmt_metric_hist_get_sum_value(metric) >= 0.0);
+        TEST_CHECK(cmt_metric_hist_get_sum_value(metric) <= finished_at - started_at);
+        TEST_CHECK(cmt_metric_hist_get_value(metric, histogram->buckets->count) == 1);
+    }
+    flb_sds_destroy(body.data);
+    if (ret == 0 && count == 4) {
+        /* Four 400 KB members require repeated removals, but form one recovery. */
+        TEST_CHECK(batch.count == 2);
+        remainder = members[2].batch;
+        TEST_ASSERT(remainder != &batch);
+        TEST_CHECK(remainder->count == 2);
+        memset(&body, 0, sizeof(body));
+        TEST_CHECK(az_li_batch_prepare_bounded(&ctx, remainder, &body) == 0);
+        if (expected_count) {
+            TEST_CHECK(cmt_metric_hist_get_count_value(metric) == 1);
+        }
+        flb_sds_destroy(body.data);
+        az_li_batch_release_json(remainder);
+        flb_free(remainder);
+    }
+    az_li_batch_release_json(&batch);
+    cmt_destroy(output.cmt);
+}
+
+static void test_rebuild_metrics_count_recovery_not_passes(void)
+{
+    check_rebuild_metrics(4, 400000, REBUILD_NO_FAILURE);
+}
+
+static void test_rebuild_metrics_count_failed_recovery(void)
+{
+    check_rebuild_metrics(4, 400000, REBUILD_REMAINDER_FAILURE);
+}
+
+static void test_rebuild_metrics_exclude_initial_preparation_failure(void)
+{
+    check_rebuild_metrics(4, 400000, REBUILD_FORMAT_FAILURE);
+}
+
+static void test_rebuild_metrics_exclude_fitting_batches(void)
+{
+    check_rebuild_metrics(2, 400000, REBUILD_NO_FAILURE);
+}
+
+static void test_rebuild_metrics_exclude_oversized_singletons(void)
+{
+    check_rebuild_metrics(1, 1200000, REBUILD_NO_FAILURE);
+}
+
+static void test_rebuild_metrics_unavailable_does_not_prevent_recovery(void)
+{
+    check_rebuild_metrics(4, 400000, REBUILD_METRIC_UNAVAILABLE);
+}
+
 TEST_LIST = {
+    {"rebuild_metrics_count_recovery_not_passes", test_rebuild_metrics_count_recovery_not_passes},
+    {"rebuild_metrics_count_failed_recovery", test_rebuild_metrics_count_failed_recovery},
+    {"rebuild_metrics_exclude_initial_preparation_failure",
+     test_rebuild_metrics_exclude_initial_preparation_failure},
+    {"rebuild_metrics_exclude_fitting_batches", test_rebuild_metrics_exclude_fitting_batches},
+    {"rebuild_metrics_exclude_oversized_singletons", test_rebuild_metrics_exclude_oversized_singletons},
+    {"rebuild_metrics_unavailable_does_not_prevent_recovery",
+     test_rebuild_metrics_unavailable_does_not_prevent_recovery},
     {"overflow_allocation_failure_preserves_members", test_overflow_allocation_failure_preserves_members},
     {"finalization_overflow_rebuilds_whole_chunks", test_finalization_overflow_rebuilds_whole_chunks},
     {"finalization_overflow_retains_empty_members", test_finalization_overflow_retains_empty_members},

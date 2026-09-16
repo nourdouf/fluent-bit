@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <fluent-bit/flb_output_plugin.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_map.h>
 #include "flb_tests_runtime.h"
 #include "../../plugins/out_azure_logs_ingestion/azure_logs_ingestion.h"
 
@@ -159,7 +160,53 @@ static void test_http_buckets_failure(void)
     check_initialization(0, 2, 0, "could not create HTTP payload size buckets");
 }
 
+static void check_rebuild_metric_initialization(int failure)
+{
+    struct flb_output_instance ins = {0};
+    struct flb_az_li ctx = {0};
+
+    ins.cmt = cmt_create();
+    TEST_ASSERT(ins.cmt != NULL);
+    ctx.ins = &ins;
+    histogram_calls = 0;
+    bucket_calls = 0;
+    fail_histogram = failure ? 2 : 0;
+    fail_buckets = 0;
+    fail_after_transfer = 0;
+    warning[0] = '\0';
+    initialize_request_metrics(&ctx);
+    TEST_CHECK(ctx.cmt_chunks_per_request != NULL);
+    TEST_CHECK(ctx.cmt_http_responses != NULL);
+    if (failure) {
+        TEST_CHECK(ctx.cmt_batch_rebuild_duration == NULL);
+        TEST_CHECK(strcmp(warning, "batch rebuild duration metric is unavailable") == 0);
+    }
+    else {
+        TEST_ASSERT(ctx.cmt_batch_rebuild_duration != NULL);
+        TEST_CHECK(warning[0] == '\0');
+        TEST_CHECK(ctx.cmt_batch_rebuild_duration->map->label_count == 1);
+        TEST_CHECK(strcmp(ctx.cmt_batch_rebuild_duration->opts.fqname,
+                          "fluentbit_azure_logs_ingestion_batch_rebuild_duration_seconds") == 0);
+        TEST_CHECK(ctx.cmt_batch_rebuild_duration->buckets->count == 11);
+        TEST_CHECK(ctx.cmt_batch_rebuild_duration->buckets->upper_bounds[0] == 0.005);
+        TEST_CHECK(ctx.cmt_batch_rebuild_duration->buckets->upper_bounds[10] == 10.0);
+    }
+    cmt_destroy(ins.cmt);
+}
+
+static void test_rebuild_metric_initialization(void)
+{
+    check_rebuild_metric_initialization(FLB_FALSE);
+}
+
+static void test_rebuild_metric_initialization_failure(void)
+{
+    check_rebuild_metric_initialization(FLB_TRUE);
+}
+
 TEST_LIST = {
+    {"rebuild_metric_initialization", test_rebuild_metric_initialization},
+    {"rebuild_metric_initialization_failure", test_rebuild_metric_initialization_failure},
     {"payload_metrics_initialization", test_payload_metrics_initialization},
     {"uncompressed_histogram_early_failure", test_uncompressed_histogram_early_failure},
     {"http_histogram_early_failure", test_http_histogram_early_failure},
