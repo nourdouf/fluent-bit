@@ -60,6 +60,14 @@ static void initialize_request_metrics(struct flb_az_li *ctx)
     if (!ctx->cmt_http_responses) {
         flb_plg_warn(ctx->ins, "HTTP response metric is unavailable");
     }
+    ctx->cmt_batch_rebuild_duration = cmt_histogram_create(
+            ctx->ins->cmt, "fluentbit", "azure_logs_ingestion", "batch_rebuild_duration_seconds",
+            "Elapsed seconds per overflow recovery attempt, including reconstruction/finalization; "
+            "excludes OAuth and HTTP.",
+            NULL, 1, (char *[]) {"name"});
+    if (!ctx->cmt_batch_rebuild_duration) {
+        flb_plg_warn(ctx->ins, "batch rebuild duration metric is unavailable");
+    }
     /* Successful instruments belong to ins->cmt, destroyed by the output core. */
 }
 

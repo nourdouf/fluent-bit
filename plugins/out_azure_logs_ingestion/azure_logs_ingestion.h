@@ -101,6 +101,7 @@ struct flb_az_li {
     struct cmt_counter *cmt_http_responses;
     struct cmt_histogram *cmt_uncompressed_payload_size;
     struct cmt_histogram *cmt_http_payload_size;
+    struct cmt_histogram *cmt_batch_rebuild_duration;
 #endif
 
     /* plugin output and config instance reference */

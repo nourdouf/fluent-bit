@@ -380,6 +380,28 @@ static uint64_t az_li_now_ms(void)
 #endif
 }
 
+#ifdef FLB_HAVE_METRICS
+static double az_li_monotonic_seconds(void)
+{
+#ifdef FLB_SYSTEM_WINDOWS
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter)) {
+        return -1.0;
+    }
+    return (double) counter.QuadPart / frequency.QuadPart;
+#else
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double) now.tv_sec + (double) now.tv_nsec / 1000000000.0;
+#endif
+}
+#endif
+
 /* Keep the manual client-credentials form, TLS context and OAuth parser/cache.
  * The generic token helper can parse a partial 200 after flb_http_do fails;
  * promote tokens only after a complete exchange. The caller owns refresh access. */
@@ -884,12 +906,23 @@ static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch
     struct az_li_batch *remainder = NULL;
     struct az_li_member *member;
     int ret;
+#ifdef FLB_HAVE_METRICS
+    int rebuilding = FLB_FALSE;
+    double started_at = -1.0;
+    double finished_at;
+#endif
 
     while (1) {
         ret = az_li_batch_prepare(ctx, batch, body);
         if (ret != 0 || body->size <= FLB_AZ_LI_MAX_BODY_BYTES || batch->count == 1) {
             break;
         }
+#ifdef FLB_HAVE_METRICS
+        if (!rebuilding && ctx->cmt_batch_rebuild_duration) {
+            rebuilding = FLB_TRUE;
+            started_at = az_li_monotonic_seconds();
+        }
+#endif
         if (body->compressed) {
             flb_free(body->data);
         }
@@ -929,6 +962,16 @@ static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch
         mk_list_add(&member->parked_link, &ctx->batch_ready);
         az_li_notify(ctx);
     }
+#ifdef FLB_HAVE_METRICS
+    if (rebuilding && started_at >= 0.0) {
+        finished_at = az_li_monotonic_seconds();
+        if (finished_at >= started_at) {
+            cmt_histogram_observe(ctx->cmt_batch_rebuild_duration, cfl_time_now(),
+                                  finished_at - started_at,
+                                  1, (char *[]) {(char *) flb_output_name(ctx->ins)});
+        }
+    }
+#endif
     return ret;
 }
 
