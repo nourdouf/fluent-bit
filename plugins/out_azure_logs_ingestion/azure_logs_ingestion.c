@@ -45,6 +45,19 @@
 
 #define AZ_LI_DISPATCH_LIMIT 64
 
+enum az_li_send_reason {
+    AZ_LI_SEND_UNBATCHED,
+    AZ_LI_SEND_TIMEOUT,
+    AZ_LI_SEND_TARGET_SIZE_REACHED,
+    AZ_LI_SEND_SHUTDOWN
+};
+
+#ifdef FLB_HAVE_METRICS
+static const char *const send_reason_names[] = {
+    "unbatched", "timeout", "target_size_reached", "shutdown"
+};
+#endif
+
 static void az_li_batch_tick(struct flb_config *config, void *data);
 static int az_li_dispatch(void *data);
 static void az_li_notify(struct flb_az_li *ctx);
@@ -463,7 +476,8 @@ static void az_li_prepare_single(struct flb_az_li *ctx, flb_sds_t json,
 }
 
 /* Own the exact prepared bytes through HTTP-client cleanup; never recompress. */
-static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_count)
+static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_count,
+                      enum az_li_send_reason send_reason)
 {
     int ret;
     int flush_status = FLB_RETRY;
@@ -476,6 +490,8 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
     char status[16];
     uint64_t metrics_timestamp;
     char *output_name;
+#else
+    (void) send_reason;
 #endif
 
     token = get_az_li_token(ctx);
@@ -519,11 +535,13 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
         cmt_histogram_observe(ctx->cmt_uncompressed_payload_size,
                               metrics_timestamp,
                               (double) body->json_size,
-                              2, (char *[]) {output_name, ctx->dcr_id});
+                              3, (char *[]) {output_name, ctx->dcr_id,
+                                             (char *) send_reason_names[send_reason]});
         cmt_histogram_observe(ctx->cmt_http_payload_size,
                               metrics_timestamp,
                               (double) final_payload_size,
-                              2, (char *[]) {output_name, ctx->dcr_id});
+                              3, (char *[]) {output_name, ctx->dcr_id,
+                                             (char *) send_reason_names[send_reason]});
     }
 #endif
 
@@ -599,6 +617,7 @@ struct az_li_batch {
     int references;
     int result;
     uint64_t deadline;
+    enum az_li_send_reason send_reason;
 };
 
 struct az_li_member {
@@ -641,10 +660,11 @@ static void az_li_notify(struct flb_az_li *ctx)
     ctx->notification_pending = FLB_TRUE;
 }
 
-static void az_li_batch_close(struct flb_az_li *ctx)
+static void az_li_batch_close(struct flb_az_li *ctx, enum az_li_send_reason reason)
 {
     struct az_li_member *sender;
 
+    ctx->collecting->send_reason = reason;
     /* A published collecting batch always has a member. Never elect an incoming non-member. */
     sender = mk_list_entry_first(&ctx->collecting->members, struct az_li_member, member_link);
     ctx->collecting = NULL;
@@ -662,9 +682,13 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
 {
     struct flb_az_li *ctx = data;
 
-    if (ctx->collecting && (az_li_now_ms() >= ctx->collecting->deadline ||
-                           config->is_shutting_down)) {
-        az_li_batch_close(ctx);
+    if (ctx->collecting) {
+        if (az_li_now_ms() >= ctx->collecting->deadline) {
+            az_li_batch_close(ctx, AZ_LI_SEND_TIMEOUT);
+        }
+        else if (config->is_shutting_down) {
+            az_li_batch_close(ctx, AZ_LI_SEND_SHUTDOWN);
+        }
     }
     az_li_notify(ctx);
     if (mk_list_is_empty(&ctx->parked) == 0 && mk_list_is_empty(&ctx->batch_ready) == 0) {
@@ -881,6 +905,7 @@ static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch
             }
             mk_list_init(&remainder->members);
             remainder->deadline = batch->deadline;
+            remainder->send_reason = batch->send_reason;
         }
         /* Only trailing members move, so the active sender stays in this batch.
          * Prepend to preserve the original order across repeated removals. */
@@ -931,7 +956,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
         az_li_prepare_single(ctx, payload, &body);
-        result = az_li_send(ctx, &body, 1);
+        result = az_li_send(ctx, &body, 1, AZ_LI_SEND_UNBATCHED);
         FLB_OUTPUT_RETURN(result);
     }
 
@@ -975,7 +1000,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
 
     if (replacement) {
         if (batch) {
-            az_li_batch_close(ctx);
+            az_li_batch_close(ctx, AZ_LI_SEND_TARGET_SIZE_REACHED);
         }
         batch = replacement;
         ctx->collecting = batch;
@@ -995,9 +1020,14 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     batch->count++;
     batch->references++;
     az_li_batch_append(ctx, batch, &member, size);
-    if ((batch->gzip ? batch->emitted_size : batch->json_size) >= ctx->batch_target_size ||
-        az_li_now_ms() >= batch->deadline || config->is_shutting_down) {
-        az_li_batch_close(ctx);
+    if ((batch->gzip ? batch->emitted_size : batch->json_size) >= ctx->batch_target_size) {
+        az_li_batch_close(ctx, AZ_LI_SEND_TARGET_SIZE_REACHED);
+    }
+    else if (az_li_now_ms() >= batch->deadline) {
+        az_li_batch_close(ctx, AZ_LI_SEND_TIMEOUT);
+    }
+    else if (config->is_shutting_down) {
+        az_li_batch_close(ctx, AZ_LI_SEND_SHUTDOWN);
     }
     if (!member.send) {
         mk_list_add(&member.parked_link, &ctx->parked);
@@ -1009,7 +1039,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     if (member.send) {
         result = az_li_batch_prepare_bounded(ctx, batch, &body);
         az_li_batch_release_json(batch);
-        batch->result = result == 0 ? az_li_send(ctx, &body, batch->count) : FLB_RETRY;
+        batch->result = result == 0 ? az_li_send(ctx, &body, batch->count,
+                                                batch->send_reason) : FLB_RETRY;
         /* No peer may return until HTTP client, body and connection cleanup finishes. */
         mk_list_foreach(head, &batch->members) {
             peer = mk_list_entry(head, struct az_li_member, member_link);

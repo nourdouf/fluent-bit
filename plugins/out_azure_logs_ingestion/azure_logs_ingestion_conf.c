@@ -97,7 +97,7 @@ static int initialize_payload_size_metrics(struct flb_az_li *ctx)
                     "uncompressed_payload_size_bytes",
                     "Uncompressed request payload size in bytes.",
                     buckets,
-                    2, (char *[]) {"name", "dcr_id"});
+                    3, (char *[]) {"name", "dcr_id", "send_reason"});
     if (!ctx->cmt_uncompressed_payload_size) {
         flb_plg_warn(ctx->ins, "could not create uncompressed payload size histogram");
         return -1;
@@ -120,7 +120,7 @@ static int initialize_payload_size_metrics(struct flb_az_li *ctx)
                     "http_payload_size_bytes",
                     "HTTP request payload size in bytes.",
                     buckets,
-                    2, (char *[]) {"name", "dcr_id"});
+                    3, (char *[]) {"name", "dcr_id", "send_reason"});
     if (!ctx->cmt_http_payload_size) {
         flb_plg_warn(ctx->ins, "could not create HTTP payload size histogram");
         cmt_histogram_destroy(ctx->cmt_uncompressed_payload_size);
