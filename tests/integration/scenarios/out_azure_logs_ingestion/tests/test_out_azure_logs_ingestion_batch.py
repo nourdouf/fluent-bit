@@ -497,6 +497,9 @@ def test_overflow_rebuild_preserves_independent_chunk_outcomes(tmp_path, monkeyp
         service.service.wait_for_condition(lambda: metrics(service)["proc_records"] == 2,
                                            timeout=10, description="both overflow chunks acknowledged")
         assert metrics(service)["retries"] == (1 if failed_status else 0)
+        assert_payload_reason(service, gates.requests[:2], "target_size_reached")
+        if failed_status:
+            assert_payload_reason(service, gates.requests[2:], "timeout")
         for item in gates.requests:
             assert len(item["records"]) == 1
             assert item["raw_size"] <= WIRE_LIMIT
@@ -1271,6 +1274,81 @@ def request_metric(service, metric_name, **labels):
             if actual == labels:
                 return float(match[3])
     return 0
+
+
+def assert_payload_reason(service, requests_seen, reason):
+    labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite", "send_reason": reason}
+    metrics_by_size = {
+        "fluentbit_azure_logs_ingestion_uncompressed_payload_size_bytes": "json_size",
+        "fluentbit_azure_logs_ingestion_http_payload_size_bytes": "raw_size",
+    }
+    service.service.wait_for_condition(
+        lambda: all(request_metric(service, name + "_count", **labels) == len(requests_seen)
+                    for name in metrics_by_size),
+        timeout=10, description=f"payload observations for {reason}")
+    for name, size in metrics_by_size.items():
+        assert request_metric(service, name + "_sum", **labels) == sum(r[size] for r in requests_seen)
+
+
+@pytest.mark.parametrize("reason,transition", [
+    ("unbatched", None),
+    ("timeout", None),
+    ("target_size_reached", None),
+    pytest.param("shutdown", "stop", marks=pytest.mark.skipif(
+        sys.platform != "linux", reason="requires Linux engine drain semantics")),
+    pytest.param("shutdown", "reload", marks=pytest.mark.skipif(
+        sys.platform != "linux", reason="requires Linux engine drain semantics")),
+])
+def test_payload_metrics_record_send_reason(tmp_path, monkeypatch, reason, transition):
+    count = 1 if transition else 3
+    service = batch_service(tmp_path, count=count, wait_ms=60000 if transition else 50)
+    path = Path(service.service.config_path)
+    config = yaml.safe_load(path.read_text())
+    config["service"].update({"grace": 15, "hot_reload": "on"})
+    output = config["pipeline"]["outputs"][0]
+    output["batch"] = reason != "unbatched"
+    output["compress"] = reason != "unbatched"
+    if reason == "target_size_reached":
+        output["batch_target_size"] = 1
+    path.write_text(yaml.safe_dump(config))
+    gates = Gates(monkeypatch)
+    try:
+        service.start()
+        if transition:
+            service.service.wait_for_condition(
+                lambda: "batch created:" in Path(service.flb.log_file).read_text(),
+                timeout=10, description="partial batch collecting before drain")
+            assert not gates.requests
+            if transition == "reload":
+                service.flb.send_sighup()
+            else:
+                service.flb.send_signal(signal.SIGTERM)
+        requests_count = count if reason in ("unbatched", "target_size_reached") else 1
+        gates.wait(service, requests_count)
+        assert len(gates.requests) == requests_count
+        assert metrics(service)["proc_records"] == 0
+        assert_payload_reason(service, gates.requests, reason)
+        for other in {"unbatched", "timeout", "target_size_reached", "shutdown"} - {reason}:
+            assert request_metric(
+                service, "fluentbit_azure_logs_ingestion_http_payload_size_bytes_count",
+                name="azure_logs_ingestion.0", dcr_id="dcr-suite", send_reason=other) == 0
+        gates.release_all()
+        if not transition:
+            service.service.wait_for_condition(
+                lambda: metrics(service)["proc_records"] == sum(range(1, count + 1)),
+                timeout=10, description="send-reason records acknowledged")
+        elif transition == "reload":
+            service.flb.wait_for_hot_reload_count(1, timeout=15)
+            assert "http_status=200" in Path(service.flb.log_file).read_text()
+        else:
+            service.service.wait_for_condition(
+                lambda: "http_status=200" in Path(service.flb.log_file).read_text() and
+                        Path(service.flb.log_file).read_text().count("[task] destroy task=") >= 1,
+                timeout=10, description="drained request acknowledged")
+    finally:
+        gates.release_all()
+        stop_checked(service)
+    assert not gates.errors
 
 
 @pytest.mark.parametrize("chunk_count", [1, 3])

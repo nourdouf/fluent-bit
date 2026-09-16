@@ -181,10 +181,10 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     service.wait_for_log("http_status=500", timeout=15)
     configure_http_response(status_code=200, body={"status": "received"})
     requests_seen = service.wait_for_requests(3, timeout=15)
-    labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite"}
+    labels = {"name": "azure_logs_ingestion.0", "dcr_id": "dcr-suite", "send_reason": "unbatched"}
     metrics = service.metrics(
         f'{HTTP_PAYLOAD_SIZE_METRIC}_count{{name="azure_logs_ingestion.0",'
-        f'dcr_id="dcr-suite"}} 2'
+        f'dcr_id="dcr-suite",send_reason="unbatched"}} 2'
     )
     service.stop()
 
