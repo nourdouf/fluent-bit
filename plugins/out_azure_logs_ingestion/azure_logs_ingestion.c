@@ -58,6 +58,15 @@ static const char *const send_reason_names[] = {
 };
 #endif
 
+/*
+ * Each batched flush callback contributes a whole chunk and waits for a shared
+ * request result. Closing collection elects one member as sender. The sender
+ * finalizes the body, moves any overflow into an independent batch, sends, and
+ * publishes the result before the other members return to the engine.
+ *
+ * The engine retains the chunks and owns retries. This plugin schedules only
+ * callbacks it has parked; network I/O resumes through the engine.
+ */
 static void az_li_batch_tick(struct flb_config *config, void *data);
 static int az_li_dispatch(void *data);
 static void az_li_notify(struct flb_az_li *ctx);
@@ -83,8 +92,8 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
                           struct flb_config *config, void *data)
 {
     struct flb_az_li *ctx;
-    (void) config;
-    (void) ins;
+    const char *option_value;
+
     (void) data;
 
     /* Allocate and initialize a context from configuration */
@@ -100,13 +109,11 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     ctx->continuation_channel[0] = -1;
     ctx->continuation_channel[1] = -1;
     ctx->batch_wait_ms = FLB_AZ_LI_DEFAULT_BATCH_WAIT_MS;
-    if (flb_output_get_property("batch_wait_ms", ins)) {
-        if (az_li_positive_option(flb_output_get_property("batch_wait_ms", ins),
-                                  &ctx->batch_wait_ms) != 0) {
-            flb_plg_error(ins, "batch_wait_ms must be a positive integer");
-            flb_az_li_ctx_destroy(ctx);
-            return -1;
-        }
+    option_value = flb_output_get_property("batch_wait_ms", ins);
+    if (option_value && az_li_positive_option(option_value, &ctx->batch_wait_ms) != 0) {
+        flb_plg_error(ins, "batch_wait_ms must be a positive integer");
+        flb_az_li_ctx_destroy(ctx);
+        return -1;
     }
     if (ctx->batch_enabled && ins->tp_workers != 0) {
         flb_plg_error(ins, "batching requires workers=0");
@@ -114,14 +121,12 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
         return -1;
     }
     ctx->batch_target_size = FLB_AZ_LI_DEFAULT_BATCH_TARGET_SIZE;
-    if (flb_output_get_property("batch_target_size", ins)) {
-        if (az_li_positive_option(flb_output_get_property("batch_target_size", ins),
-                                  &ctx->batch_target_size) != 0 ||
-            ctx->batch_target_size > FLB_AZ_LI_MAX_BODY_BYTES) {
-            flb_plg_error(ins, "batch_target_size must be an integer from 1 to 1048576 bytes");
-            flb_az_li_ctx_destroy(ctx);
-            return -1;
-        }
+    option_value = flb_output_get_property("batch_target_size", ins);
+    if (option_value && (az_li_positive_option(option_value, &ctx->batch_target_size) != 0 ||
+                         ctx->batch_target_size > FLB_AZ_LI_MAX_BODY_BYTES)) {
+        flb_plg_error(ins, "batch_target_size must be an integer from 1 to 1048576 bytes");
+        flb_az_li_ctx_destroy(ctx);
+        return -1;
     }
     /* Both batched and unbatched main-thread flushes can wait behind OAuth.
      * Legacy workers retain synchronous OAuth and mutex-protected token access. */
@@ -142,8 +147,8 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
     return 0;
 }
 
-/* A duplicate function copied from the azure log analytics plugin.
-    allocates sds string */
+/* Format a borrowed engine chunk as a JSON array with the configured timestamp
+ * field. On success, the caller owns the returned SDS string. */
 static int az_li_format(const void *in_buf, size_t in_bytes,
                         char **out_buf, size_t *out_size,
                         struct flb_az_li *ctx,
@@ -289,12 +294,14 @@ static void az_li_elements_destroy(struct az_li_elements *elements)
     memset(elements, 0, sizeof(*elements));
 }
 
-/* Only refresh waiters are resumed here; network I/O resumes in the engine. */
+/* Lives on the waiting coroutine's stack. The dispatcher unlinks it before
+ * resuming the coroutine, which may immediately return and invalidate it. */
 struct az_li_auth_waiter {
     struct flb_coro *coro;
     struct mk_list link;
 };
 
+/* Wait for and claim token-refresh ownership on the main scheduler. */
 static void az_li_auth_acquire(struct flb_az_li *ctx)
 {
     struct az_li_auth_waiter waiter;
@@ -309,7 +316,8 @@ static void az_li_auth_acquire(struct flb_az_li *ctx)
 
 static char *az_li_token_request(struct flb_az_li *ctx);
 
-/* Gets OAuth token; (allocates sds string everytime, must deallocate) */
+/* Return an owned Authorization header value from the cached or refreshed token.
+ * Main-scheduler callers can yield behind a refresh; worker threads use a mutex. */
 static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
 {
     int ret = 0;
@@ -367,7 +375,6 @@ static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
 
         token = az_li_token_request(ctx);
 
-        /* Copy string to prevent race conditions */
         if (!token) {
             flb_plg_error(ctx->ins, "error retrieving oauth2 access token");
             goto token_cleanup;
@@ -375,12 +382,10 @@ static flb_sds_t get_az_li_token(struct flb_az_li *ctx)
         flb_plg_debug(ctx->ins, "got azure token");
     }
 
-    /* Reached this code-block means, got new token or token not expired */
-    /* Either way we copy the token to a new string */
+    /* The request must retain its own token value if another flush refreshes the cache. */
     token_len = flb_sds_len(ctx->u_auth->token_type) + 2 +
                     flb_sds_len(ctx->u_auth->access_token);
     flb_plg_debug(ctx->ins, "create token header string");
-    /* Now create */
     token_return = flb_sds_create_size(token_len);
     if (!token_return) {
         flb_plg_error(ctx->ins, "error creating token buffer");
@@ -417,6 +422,7 @@ static uint64_t az_li_now_ms(void)
 }
 
 #ifdef FLB_HAVE_METRICS
+/* A failed clock read returns -1 so callers can omit an invalid duration sample. */
 static double az_li_monotonic_seconds(void)
 {
 #ifdef FLB_SYSTEM_WINDOWS
@@ -501,14 +507,29 @@ cleanup:
     return token;
 }
 
+/* Owned request bytes, separate from the retained member JSON used for rebuilding.
+ * Plain data is an SDS string; compressed data is a flb_free-compatible allocation.
+ * az_li_send consumes the bytes on every outcome, including failures before HTTP. */
 struct az_li_body {
     void *data;
-    size_t size;
-    size_t json_size;
+    size_t size;      /* Exact outgoing-body bytes. */
+    size_t json_size; /* JSON bytes before compression. */
     int compressed;
 };
 
-/* Unbatched mode keeps its one-shot compression. */
+/* Release the owned buffer, not the caller's body structure. */
+static void az_li_body_release(struct az_li_body *body)
+{
+    if (body->compressed) {
+        flb_free(body->data);
+    }
+    else {
+        flb_sds_destroy(body->data);
+    }
+    body->data = NULL;
+}
+
+/* Consume the JSON string into a request body, keeping one-shot compression in unbatched mode. */
 static void az_li_prepare_single(struct flb_az_li *ctx, flb_sds_t json,
                                  struct az_li_body *body)
 {
@@ -571,7 +592,6 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
         goto cleanup;
     }
 
-    /* Append headers */
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
     if (body->compressed) {
@@ -603,7 +623,6 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
     }
 #endif
 
-    /* Execute rest call */
     ret = flb_http_do(c, &b_sent);
 #ifdef FLB_HAVE_METRICS
     /* Only completed HTTP exchanges count. A transport error may leave a partial
@@ -621,72 +640,65 @@ static int az_li_send(struct flb_az_li *ctx, struct az_li_body *body, int chunk_
         flush_status = FLB_RETRY;
         goto cleanup;
     }
-    else {
-        if (c->resp.status >= 200 && c->resp.status <= 299) {
-            flb_plg_info(ctx->ins, "http_status=%i, dcr_id=%s, table=%s",
-                         c->resp.status, ctx->dcr_id, ctx->table_name);
-            flush_status = FLB_OK;
-            goto cleanup;
-        }
-        else {
-            if (c->resp.payload_size > 0) {
-                flb_plg_warn(ctx->ins, "http_status=%i:\n%s",
-                             c->resp.status, c->resp.payload);
-            }
-            else {
-                flb_plg_warn(ctx->ins, "http_status=%i", c->resp.status);
-            }
-            flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
-            flush_status = FLB_RETRY;
-            goto cleanup;
-        }
+    if (c->resp.status >= 200 && c->resp.status <= 299) {
+        flb_plg_info(ctx->ins, "http_status=%i, dcr_id=%s, table=%s",
+                     c->resp.status, ctx->dcr_id, ctx->table_name);
+        flush_status = FLB_OK;
+        goto cleanup;
     }
+    if (c->resp.payload_size > 0) {
+        flb_plg_warn(ctx->ins, "http_status=%i:\n%s",
+                     c->resp.status, c->resp.payload);
+    }
+    else {
+        flb_plg_warn(ctx->ins, "http_status=%i", c->resp.status);
+    }
+    flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
+    flush_status = FLB_RETRY;
 
 cleanup:
     if (c) {
         flb_http_client_destroy(c);
     }
-    if (body->compressed) {
-        flb_free(body->data);
-    }
-    else {
-        flb_sds_destroy(body->data);
-    }
-    body->data = NULL;
+    az_li_body_release(body);
     if (u_conn) {
         flb_upstream_conn_release(u_conn);
     }
 
-    /* destory token at last after HTTP call has finished */
+    /* Keep the token alive until HTTP-client cleanup has finished. */
     if (token) {
         flb_sds_destroy(token);
     }
     return flush_status;
 }
 
-/* Membership borrows postprocessor chunks until every request outcome is published.
- * Only the dispatcher resumes plugin-parked callbacks, never a sender in network I/O. */
+/* One collecting or closed request group. The member callbacks keep this heap
+ * object alive after it leaves ctx->collecting; the last returning member frees it.
+ * count describes request membership, while references falls as callbacks return. */
 struct az_li_batch {
-    struct mk_list members;
+    struct mk_list members; /* az_li_member.member_link; does not own the member storage. */
     int count;
-    size_t json_size;
-    size_t emitted_size;
+    size_t json_size;       /* Includes both JSON array brackets. */
+    size_t emitted_size;    /* Streaming gzip bytes; excludes pending output and the trailer. */
     struct az_li_gzip_stream *gzip;
     int references;
-    int result;
-    uint64_t deadline;
+    int result;            /* Sender publishes this before peers are eligible to resume. */
+    uint64_t deadline;     /* Monotonic milliseconds, fixed by the first member. */
     enum az_li_send_reason send_reason;
 };
 
+/* One flush callback's stack-owned state. Its coroutine stays alive while parked.
+ * A member remains in its batch list while its other link moves between the parked
+ * and ready queues. Overflow can change batch while the callback is suspended. */
 struct az_li_member {
     struct mk_list member_link;
     struct mk_list parked_link;
     struct az_li_batch *batch;
     struct flb_coro *coro;
-    /* Owns the formatted JSON array and exposes its elements, minus the surrounding brackets, to the batch. */
+    /* Owned JSON retained through size selection, with a view of its elements. */
     struct az_li_elements formatted_elements;
-    int comma;
-    int send;
+    int comma;          /* Whether this member's nonempty JSON needs a preceding separator. */
+    int send;           /* This callback is the elected sender, not an HTTP completion flag. */
 };
 
 static int az_li_notification_interrupted(void)
@@ -698,14 +710,21 @@ static int az_li_notification_interrupted(void)
 #endif
 }
 
+/* Coalesce eligible callback work into one unread dispatcher notification. */
 static void az_li_notify(struct flb_az_li *ctx)
 {
     unsigned char notification = 1;
     ssize_t ret;
+    int batch_ready;
+    int auth_ready;
 
-    if (ctx->notification_pending ||
-        (mk_list_is_empty(&ctx->batch_ready) == 0 &&
-         (ctx->auth_refreshing || mk_list_is_empty(&ctx->auth_waiters) == 0))) {
+    if (ctx->notification_pending) {
+        return;
+    }
+    /* Monkey's list API returns zero for empty, rather than a boolean predicate. */
+    batch_ready = mk_list_is_empty(&ctx->batch_ready) != 0;
+    auth_ready = !ctx->auth_refreshing && mk_list_is_empty(&ctx->auth_waiters) != 0;
+    if (!batch_ready && !auth_ready) {
         return;
     }
     /* Main-thread ownership permits only one unread wake-up, not one per member. */
@@ -719,6 +738,8 @@ static void az_li_notify(struct flb_az_li *ctx)
     ctx->notification_pending = FLB_TRUE;
 }
 
+/* Stop collection and elect the first member as sender. Queue it only if parked;
+ * a sender already running in its flush callback can proceed without a wake-up. */
 static void az_li_batch_close(struct flb_az_li *ctx, enum az_li_send_reason reason)
 {
     struct az_li_member *sender;
@@ -737,6 +758,7 @@ static void az_li_batch_close(struct flb_az_li *ctx, enum az_li_send_reason reas
     }
 }
 
+/* Check collection deadlines and shutdown; callback resumption belongs to the dispatcher. */
 static void az_li_batch_tick(struct flb_config *config, void *data)
 {
     struct flb_az_li *ctx = data;
@@ -756,6 +778,8 @@ static void az_li_batch_tick(struct flb_config *config, void *data)
     }
 }
 
+/* Resume a bounded, fair mix of ready batch members and token-refresh waiters.
+ * Never resume a sender waiting on network I/O: the engine owns that continuation. */
 static int az_li_dispatch(void *data)
 {
     struct mk_event *event = data;
@@ -808,6 +832,7 @@ static int az_li_dispatch(void *data)
     return 0;
 }
 
+/* Abandon compression while retaining member JSON for plain-body preparation. */
 static void az_li_batch_plain(struct flb_az_li *ctx, struct az_li_batch *batch)
 {
     az_li_gzip_stream_destroy(batch->gzip);
@@ -826,26 +851,34 @@ static void az_li_batch_append(struct flb_az_li *ctx, struct az_li_batch *batch,
     }
     member->comma = batch->json_size > 2;
     batch->json_size += member->formatted_elements.size + member->comma;
-    if (batch->gzip &&
-        ((member->comma && az_li_gzip_stream_append(batch->gzip, ",", 1,
-                                                    &batch->emitted_size) != 0) ||
-         az_li_gzip_stream_append(batch->gzip, member->formatted_elements.data,
-                                  member->formatted_elements.size,
-                                  &batch->emitted_size) != 0)) {
+    if (!batch->gzip) {
+        return;
+    }
+    if (member->comma &&
+        az_li_gzip_stream_append(batch->gzip, ",", 1, &batch->emitted_size) != 0) {
+        az_li_batch_plain(ctx, batch);
+        return;
+    }
+    if (az_li_gzip_stream_append(batch->gzip, member->formatted_elements.data,
+                                 member->formatted_elements.size,
+                                 &batch->emitted_size) != 0) {
         az_li_batch_plain(ctx, batch);
     }
 }
 
+/* Release retained JSON without releasing the callback records or engine chunks. */
 static void az_li_batch_release_json(struct az_li_batch *batch)
 {
     struct mk_list *head;
     struct az_li_member *member;
+
     mk_list_foreach(head, &batch->members) {
         member = mk_list_entry(head, struct az_li_member, member_link);
         az_li_elements_destroy(&member->formatted_elements);
     }
 }
 
+/* Assemble a new owned SDS array from retained member JSON, or return NULL. */
 static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
 {
     struct mk_list *head;
@@ -857,11 +890,11 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     /* Keep member arrays until final size selection permits network IO.
      * SDS adds its allocation header and a NUL terminator. */
     if (total > SIZE_MAX - FLB_SDS_HEADER_SIZE - 1) {
-        goto cleanup;
+        return NULL;
     }
     combined = flb_sds_create_size(total);
     if (!combined) {
-        goto cleanup;
+        return NULL;
     }
     combined[0] = '[';
     mk_list_foreach(head, &batch->members) {
@@ -879,10 +912,11 @@ static flb_sds_t az_li_batch_format(struct az_li_batch *batch)
     combined[offset] = '\0';
     flb_sds_len_set(combined, offset);
 
-cleanup:
     return combined;
 }
 
+/* Finalize the current candidate into an owned body, with plain JSON as gzip's
+ * fallback. Retain member arrays so the caller can still rebuild after sizing. */
 static int az_li_batch_prepare(struct flb_az_li *ctx, struct az_li_batch *batch,
                                struct az_li_body *body)
 {
@@ -910,6 +944,8 @@ static int az_li_batch_prepare(struct flb_az_li *ctx, struct az_li_batch *batch,
     return body->data ? 0 : -1;
 }
 
+/* Reset sizing and compression for the current membership, replaying retained
+ * JSON. az_li_batch_prepare performs the subsequent final body assembly. */
 static void az_li_batch_rebuild(struct flb_az_li *ctx, struct az_li_batch *batch)
 {
     struct mk_list *head;
@@ -933,6 +969,10 @@ static void az_li_batch_rebuild(struct flb_az_li *ctx, struct az_li_batch *batch
     }
 }
 
+/* Select a finalized body within the multi-chunk limit; oversized singletons
+ * retain their existing send/retry behavior. Move trailing members into an
+ * independent batch and rebuild as needed. A remainder can be queued even if
+ * preparation of the retained prefix fails; its callbacks keep their own result. */
 static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch *batch,
                                        struct az_li_body *body)
 {
@@ -956,12 +996,7 @@ static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch
             started_at = az_li_monotonic_seconds();
         }
 #endif
-        if (body->compressed) {
-            flb_free(body->data);
-        }
-        else {
-            flb_sds_destroy(body->data);
-        }
+        az_li_body_release(body);
         memset(body, 0, sizeof(*body));
         if (!remainder) {
             remainder = flb_calloc(1, sizeof(*remainder));
@@ -1008,6 +1043,9 @@ static int az_li_batch_prepare_bounded(struct flb_az_li *ctx, struct az_li_batch
     return ret;
 }
 
+/* Keep the engine chunk pending until this member's sender publishes a result.
+ * Nonsenders yield rather than acknowledge early; all members release their own
+ * batch reference before returning that result to the engine. */
 static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
                            struct flb_output_flush *out_flush,
                            struct flb_input_instance *i_ins,
@@ -1036,7 +1074,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(result);
     }
 
-    /* The callback owns its formatted storage until admission; malformed chunks cannot
+    /* The callback owns its final array until admission; malformed chunks cannot
      * poison an existing batch or leave a partially initialized member behind. */
     if (az_li_format_elements(event_chunk->data, event_chunk->size,
                               &member.formatted_elements, ctx, config) != 0) {
@@ -1062,7 +1100,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         replacement->deadline = created_at + ctx->batch_wait_ms;
     }
 
-    /* Only callbacks parked by the plugin need polling; idle outputs need no timer. */
+    /* Install the deadline timer before publishing a new collector. Callback
+     * completion is event-driven; outputs without batch work need no timer. */
     if (!ctx->batch_timer &&
         flb_sched_timer_cb_create(flb_sched_ctx_get(), FLB_SCHED_TIMER_CB_PERM,
                                   10, az_li_batch_tick, ctx, &ctx->batch_timer) != 0) {
@@ -1073,9 +1112,6 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     }
 
     if (replacement) {
-        if (batch) {
-            az_li_batch_close(ctx, AZ_LI_SEND_TARGET_SIZE_REACHED);
-        }
         batch = replacement;
         ctx->collecting = batch;
         flb_plg_debug(ctx->ins, "batch created: now=%" PRIu64 " deadline=%" PRIu64,
