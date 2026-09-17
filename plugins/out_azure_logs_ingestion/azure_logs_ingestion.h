@@ -48,26 +48,29 @@
 #include <cmetrics/cmt_counter.h>
 #endif
 
-/* Context structure for Azure Logs Ingestion API */
+/* Configuration and shared runtime state for one output instance. Batching and
+ * coroutine queues belong to the main scheduler (workers=0); threaded token
+ * access uses token_mutex. Closed batches live through their member callbacks,
+ * independently of the next batch accepting chunks in collecting. */
 struct flb_az_li {
     /* Opt-in, whole callback chunks; used only on the main scheduler. */
     int batch_enabled;
     int batch_wait_ms;
     int batch_target_size;
-    struct az_li_batch *collecting;
-    struct mk_list parked;
-    struct mk_list batch_ready;
+    struct az_li_batch *collecting; /* The only batch still accepting members, or NULL. */
+    struct mk_list parked;          /* az_li_member.parked_link: awaiting closure or a result. */
+    struct mk_list batch_ready;     /* The same link: callbacks eligible for dispatcher resumption. */
     struct flb_sched_timer *batch_timer;
 
     /* Shared bounded continuation for batch and auth waiters, only workers=0. */
     struct mk_event continuation_event;
     int continuation_channel[2];
     int notification_pending;
-    int prefer_auth;
+    int prefer_auth; /* Next choice when both callback classes are ready. */
 
     /* Coroutine single-flight token refresh, only for workers=0. */
     int auth_refreshing;
-    struct mk_list auth_waiters;
+    struct mk_list auth_waiters; /* Stack-owned az_li_auth_waiter.link entries. */
 
     /* log ingestion account setup */
     flb_sds_t tenant_id;
@@ -85,7 +88,7 @@ struct flb_az_li {
     /* compress payload */
     int compress_enabled;
 
-    /* mangement auth */
+    /* Authentication state. */
     flb_sds_t auth_url_override;
     flb_sds_t auth_url;
     struct flb_oauth2 *u_auth;
