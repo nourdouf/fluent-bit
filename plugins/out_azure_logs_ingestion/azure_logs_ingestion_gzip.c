@@ -23,37 +23,39 @@
 #include <miniz/miniz.h>
 #include <limits.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "azure_logs_ingestion_gzip.h"
 
 #define AZ_LI_GZIP_HEADER_SIZE 10
+#define AZ_LI_GZIP_TRAILER_SIZE 8
 
+/* Fixed gzip header from RFC 1952, section 2.3.1:
+ * https://www.rfc-editor.org/rfc/rfc1952#section-2.3.1 */
 static inline void az_li_gzip_header(void *buf)
 {
-    uint8_t *p;
+    static const uint8_t header[AZ_LI_GZIP_HEADER_SIZE] = {
+        0x1F, 0x8B,  /* Gzip format signature (the two "magic bytes"). */
+        MZ_DEFLATED, /* Compression method: DEFLATE. */
+        0,           /* Flags: no optional header fields. */
+        0, 0, 0, 0,  /* Modification time: unspecified. */
+        0,           /* No extra compression flags. */
+        0xFF         /* Originating operating system: unspecified. */
+    };
 
-    /* GZip Magic bytes */
-    p = buf;
-    *p++ = 0x1F;
-    *p++ = 0x8B;
-    *p++ = 8;
-    *p++ = 0;
-    *p++ = 0;
-    *p++ = 0;
-    *p++ = 0;
-    *p++ = 0;
-    *p++ = 0;
-    *p++ = 0xFF;
+    memcpy(buf, header, sizeof(header));
 }
 
-
+/* One gzip stream: raw DEFLATE from miniz, with a header and trailer supplied here.
+ * Owns the compressor and output allocation until finish transfers the output.
+ * A finished or failed stream remains allocated, but only destroy is then valid. */
 struct az_li_gzip_stream {
     mz_stream deflater;
     unsigned char *body;
     size_t size;
     size_t capacity;
-    uint32_t crc;
-    uint32_t input_size;
+    uint32_t crc;        /* CRC32 of the uncompressed input. */
+    uint32_t input_size; /* Gzip ISIZE: input length modulo 2^32. */
     int terminal;
 };
 
@@ -73,6 +75,7 @@ static void gzip_stream_free(void *opaque, void *address)
     flb_free(address);
 }
 
+/* Discard compressor/output state, leaving the stream object for its caller to destroy. */
 static int gzip_stream_fail(struct az_li_gzip_stream *stream)
 {
     if (stream) {
@@ -113,7 +116,9 @@ static int gzip_stream_reserve(struct az_li_gzip_stream *stream, size_t extra)
     return 0;
 }
 
-/* Track sizes from avail_* deltas, independent of miniz's total_* widths. */
+/* Append mode consumes input without forcing out all pending compressed bytes;
+ * finish mode drains to the end of the DEFLATE stream. Track emitted sizes from
+ * avail_* deltas, independent of miniz's total_* widths. */
 static int gzip_stream_pump(struct az_li_gzip_stream *stream, int flush)
 {
     mz_stream *deflater = &stream->deflater;
@@ -159,6 +164,7 @@ struct az_li_gzip_stream *az_li_gzip_stream_create(void)
     }
     stream->deflater.zalloc = gzip_stream_alloc;
     stream->deflater.zfree = gzip_stream_free;
+    /* Negative window bits request raw DEFLATE; this helper supplies the gzip wrapper. */
     status = mz_deflateInit2(&stream->deflater, MZ_DEFAULT_COMPRESSION,
                             MZ_DEFLATED, -MZ_DEFAULT_WINDOW_BITS, 9, MZ_DEFAULT_STRATEGY);
     if (status != MZ_OK || gzip_stream_reserve(stream, AZ_LI_GZIP_HEADER_SIZE) != 0) {
@@ -188,7 +194,6 @@ int az_li_gzip_stream_append(struct az_li_gzip_stream *stream,
             return gzip_stream_fail(stream);
         }
         stream->crc = mz_crc32(stream->crc, input, part);
-        /* Gzip ISIZE is the input length modulo 2^32. */
         stream->input_size += (uint32_t) part;
         input += part;
         len -= part;
@@ -218,15 +223,16 @@ int az_li_gzip_stream_finish(struct az_li_gzip_stream *stream,
     stream->deflater.avail_in = 0;
     if (gzip_stream_pump(stream, MZ_FINISH) != 0 ||
         mz_deflateEnd(&stream->deflater) != MZ_OK ||
-        gzip_stream_reserve(stream, 8) != 0) {
+        gzip_stream_reserve(stream, AZ_LI_GZIP_TRAILER_SIZE) != 0) {
         return gzip_stream_fail(stream);
     }
+    /* RFC 1952 trailer: CRC32 followed by ISIZE, both little-endian 32-bit values. */
     footer = stream->body + stream->size;
     for (i = 0; i < 4; i++) {
         footer[i] = (stream->crc >> (8 * i)) & 0xff;
         footer[4 + i] = (stream->input_size >> (8 * i)) & 0xff;
     }
-    stream->size += 8;
+    stream->size += AZ_LI_GZIP_TRAILER_SIZE;
     *out_data = stream->body;
     *out_len = stream->size;
     stream->body = NULL;
